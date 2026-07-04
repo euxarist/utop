@@ -26,6 +26,7 @@ use windows_sys::Win32::System::Console::{
     ENABLE_WINDOW_INPUT,
     SetConsoleCtrlHandler,
     ReadConsoleInputW, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT_RECORD,
+    WINDOW_BUFFER_SIZE_EVENT,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
@@ -330,6 +331,15 @@ fn clip_to_width(line: &str, width: usize) -> String {
     line.chars().take(width).collect()
 }
 
+fn format_to_width(args: fmt::Arguments<'_>, width: usize) -> String {
+    let clipped = clip_to_width(&args.to_string(), width);
+    if clipped.chars().count() < width {
+        format!("{:<width$}", clipped, width = width)
+    } else {
+        clipped
+    }
+}
+
 const STYLE_NONE: &str = "";
 const STYLE_TITLE: &str = "\x1B[1m\x1B[38;5;51m";
 const STYLE_SECTION: &str = "\x1B[1m\x1B[38;5;45m";
@@ -418,11 +428,11 @@ fn draw_line_with_style<W: Write>(
     style: &str,
     args: fmt::Arguments<'_>,
 ) -> io::Result<()> {
-    let line = clip_to_width(&args.to_string(), width);
+    let line = format_to_width(args, width);
     if reverse {
-        write!(out, "\x1B[{};1H\x1B[0m\x1B[7m{}\x1B[0m\x1B[K", row, line)
+        write!(out, "\x1B[{};1H\x1B[0m\x1B[7m{}\x1B[0m", row, line)
     } else {
-        write!(out, "\x1B[{};1H\x1B[0m{}{}\x1B[0m\x1B[K", row, style, line)
+        write!(out, "\x1B[{};1H\x1B[0m{}{}\x1B[0m", row, style, line)
     }
 }
 
@@ -1894,6 +1904,244 @@ enum KeyType {
     None, Quit, Up, Down, Left, Right, Backspace, Enter, Esc, Char(char),
 }
 
+#[cfg(target_os = "windows")]
+enum ConsoleEvent {
+    Resize,
+    Key(KeyType),
+}
+
+#[cfg(target_os = "windows")]
+static PENDING_CONSOLE_EVENTS: std::sync::Mutex<Vec<ConsoleEvent>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_os = "windows")]
+static REPORTED_CONSOLE_SIZE: std::sync::Mutex<Option<(u16, usize)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+fn note_reported_console_size(rows: i16, cols: i16) {
+    if cols <= 0 || rows <= 0 {
+        return;
+    }
+    let size = (rows as u16, cols as usize);
+    if let Ok(mut reported) = REPORTED_CONSOLE_SIZE.lock() {
+        *reported = Some(match *reported {
+            Some((h, w)) => (h.max(size.0), w.max(size.1)),
+            None => size,
+        });
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_csbi_dimensions() -> (u16, usize) {
+    unsafe {
+        let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if GetConsoleScreenBufferInfo(h, &mut csbi) == 0 {
+            return (24u16, 80usize);
+        }
+        let window_w = (csbi.srWindow.Right - csbi.srWindow.Left + 1).max(1) as usize;
+        let window_h = (csbi.srWindow.Bottom - csbi.srWindow.Top + 1).max(1) as u16;
+        let buffer_w = csbi.dwSize.X.max(1) as usize;
+        let buffer_h = csbi.dwSize.Y.max(1) as u16;
+        (window_h.max(buffer_h), window_w.max(buffer_w))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_terminal_size_response(response: &str) -> Option<(u16, usize)> {
+    let body = response
+        .trim_start_matches('\x1b')
+        .trim_start_matches('[')
+        .strip_prefix("8;")?;
+    let (rows, cols) = body.strip_suffix('t')?.split_once(';')?;
+    let h: u16 = rows.parse().ok()?;
+    let w: usize = cols.parse().ok()?;
+    (h > 0 && w > 0).then_some((h, w))
+}
+
+#[cfg(target_os = "windows")]
+fn query_terminal_size_vt() -> Option<(u16, usize)> {
+    let _ = io::stdout().write_all(b"\x1b[18t");
+    let _ = io::stdout().flush();
+
+    let mut response = String::new();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    unsafe {
+        let stdin = GetStdHandle(STD_INPUT_HANDLE);
+        while Instant::now() < deadline {
+            if WaitForSingleObject(stdin, 5) != 0 {
+                continue;
+            }
+            let mut num_events: u32 = 0;
+            if GetNumberOfConsoleInputEvents(stdin, &mut num_events) == 0 || num_events == 0 {
+                continue;
+            }
+            let mut record: INPUT_RECORD = std::mem::zeroed();
+            let mut events_read: u32 = 0;
+            if ReadConsoleInputW(stdin, &mut record, 1, &mut events_read) == 0 || events_read == 0 {
+                break;
+            }
+            if record.EventType as u32 != 1 {
+                continue;
+            }
+            let ke = record.Event.KeyEvent;
+            if ke.bKeyDown == 0 {
+                continue;
+            }
+            let ch = ke.uChar.UnicodeChar;
+            if ch == 27 {
+                response.clear();
+                response.push('\x1b');
+                continue;
+            }
+            if ch == 0 {
+                continue;
+            }
+            if let Some(c) = char::from_u32(ch as u32) {
+                response.push(c);
+                if c == 't' && response.contains(';') {
+                    break;
+                }
+            }
+            if response.len() > 32 {
+                break;
+            }
+        }
+    }
+
+    parse_terminal_size_response(&response).inspect(|&(h, w)| note_reported_console_size(h as i16, w as i16))
+}
+
+#[cfg(target_os = "windows")]
+fn terminal_dimensions() -> (u16, usize) {
+    drain_resize_events();
+    let (mut height, mut width) = read_csbi_dimensions();
+    if let Ok(reported) = REPORTED_CONSOLE_SIZE.lock() {
+        if let Some((h, w)) = *reported {
+            height = height.max(h);
+            width = width.max(w);
+        }
+    }
+    (height, width)
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_terminal_size_if_needed(needs_vt_size_query: &mut bool) {
+    if !*needs_vt_size_query {
+        return;
+    }
+    let _ = query_terminal_size_vt();
+    *needs_vt_size_query = false;
+}
+
+#[cfg(target_os = "windows")]
+fn push_console_event(event: ConsoleEvent) {
+    if let Ok(mut pending) = PENDING_CONSOLE_EVENTS.lock() {
+        pending.push(event);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn drain_resize_events() {
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        loop {
+            let mut num_events: u32 = 0;
+            if GetNumberOfConsoleInputEvents(h, &mut num_events) == 0 || num_events == 0 {
+                break;
+            }
+            let mut record: INPUT_RECORD = std::mem::zeroed();
+            let mut events_read: u32 = 0;
+            if ReadConsoleInputW(h, &mut record, 1, &mut events_read) == 0 || events_read == 0 {
+                break;
+            }
+            match record.EventType as u32 {
+                WINDOW_BUFFER_SIZE_EVENT => {
+                    let size = record.Event.WindowBufferSizeEvent.dwSize;
+                    note_reported_console_size(size.Y, size.X);
+                }
+                1 /* KEY_EVENT */ => {
+                    if let Some(key) = parse_key_event(record.Event.KeyEvent) {
+                        push_console_event(ConsoleEvent::Key(key));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn poll_console_events() -> Vec<ConsoleEvent> {
+    let mut events = PENDING_CONSOLE_EVENTS
+        .lock()
+        .map(|mut pending| pending.drain(..).collect::<Vec<_>>())
+        .unwrap_or_default();
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        loop {
+            let mut num_events: u32 = 0;
+            if GetNumberOfConsoleInputEvents(h, &mut num_events) == 0 || num_events == 0 {
+                break;
+            }
+            let mut record: INPUT_RECORD = std::mem::zeroed();
+            let mut events_read: u32 = 0;
+            if ReadConsoleInputW(h, &mut record, 1, &mut events_read) == 0 || events_read == 0 {
+                break;
+            }
+            match record.EventType as u32 {
+                WINDOW_BUFFER_SIZE_EVENT => {
+                    let size = record.Event.WindowBufferSizeEvent.dwSize;
+                    note_reported_console_size(size.Y, size.X);
+                    events.push(ConsoleEvent::Resize);
+                }
+                1 /* KEY_EVENT */ => {
+                    if let Some(key) = parse_key_event(record.Event.KeyEvent) {
+                        events.push(ConsoleEvent::Key(key));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    events
+}
+
+#[cfg(target_os = "windows")]
+fn parse_key_event(ke: KEY_EVENT_RECORD) -> Option<KeyType> {
+    if ke.bKeyDown == 0 {
+        return None;
+    }
+    let ch = unsafe { ke.uChar.UnicodeChar };
+    if ch != 0 {
+        let byte = ch as u8;
+        if byte == 3 {
+            return Some(KeyType::Quit);
+        }
+        if byte == 27 {
+            return Some(KeyType::Esc);
+        }
+        if byte == 127 || byte == 8 {
+            return Some(KeyType::Backspace);
+        }
+        if byte == 10 || byte == 13 {
+            return Some(KeyType::Enter);
+        }
+        if byte.is_ascii_graphic() || byte == b' ' {
+            return Some(KeyType::Char(byte as char));
+        }
+        return None;
+    }
+    match ke.wVirtualKeyCode {
+        0x26 /* VK_UP */ => Some(KeyType::Up),
+        0x28 /* VK_DOWN */ => Some(KeyType::Down),
+        0x25 /* VK_LEFT */ => Some(KeyType::Left),
+        0x27 /* VK_RIGHT */ => Some(KeyType::Right),
+        _ => None,
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_key() -> KeyType {
     let mut buf = [0u8; 16];
@@ -1917,41 +2165,100 @@ fn read_key() -> KeyType {
     KeyType::None
 }
 
-#[cfg(target_os = "windows")]
-fn read_key() -> KeyType {
-    let mut num_events: u32 = 0;
-    unsafe {
-        let h = GetStdHandle(STD_INPUT_HANDLE);
-        // Non-blocking: return None immediately if no events pending
-        if GetNumberOfConsoleInputEvents(h, &mut num_events) == 0 || num_events == 0 {
-            return KeyType::None;
+
+
+fn handle_key(
+    k: KeyType,
+    is_search: &mut bool,
+    filter: &mut String,
+    selection: &mut usize,
+    sort: &mut SortMode,
+    needs_sample: &mut bool,
+    needs_render: &mut bool,
+) -> bool {
+    if *is_search {
+        match k {
+            KeyType::Esc => {
+                *is_search = false;
+                filter.clear();
+                *needs_sample = true;
+                *needs_render = true;
+            }
+            KeyType::Enter => {
+                *is_search = false;
+                *needs_render = true;
+            }
+            KeyType::Backspace => {
+                if !filter.is_empty() {
+                    filter.pop();
+                    *selection = 0;
+                    *needs_sample = true;
+                } else {
+                    *is_search = false;
+                    *needs_render = true;
+                }
+            }
+            KeyType::Char(c) if filter.len() < 63 => {
+                filter.push(c);
+                *selection = 0;
+                *needs_sample = true;
+            }
+            _ => {}
         }
-        let mut record: INPUT_RECORD = std::mem::zeroed();
-        let mut events_read: u32 = 0;
-        if ReadConsoleInputW(h, &mut record, 1, &mut events_read) == 0 || events_read == 0 {
-            return KeyType::None;
-        }
-        if record.EventType != 1 /* KEY_EVENT */ { return KeyType::None; }
-        let ke: KEY_EVENT_RECORD = record.Event.KeyEvent;
-        if ke.bKeyDown == 0 { return KeyType::None; }
-        let ch = ke.uChar.UnicodeChar;
-        if ch != 0 {
-            let byte = ch as u8;
-            if byte == 3 { return KeyType::Quit; }
-            if byte == 27 { return KeyType::Esc; }
-            if byte == 127 || byte == 8 { return KeyType::Backspace; }
-            if byte == 10 || byte == 13 { return KeyType::Enter; }
-            if byte.is_ascii_graphic() || byte == b' ' { return KeyType::Char(byte as char); }
-            return KeyType::None;
-        }
-        match ke.wVirtualKeyCode {
-            0x26 /* VK_UP */ => KeyType::Up,
-            0x28 /* VK_DOWN */ => KeyType::Down,
-            0x25 /* VK_LEFT */ => KeyType::Left,
-            0x27 /* VK_RIGHT */ => KeyType::Right,
-            _ => KeyType::None,
-        }
+        return false;
     }
+
+    match k {
+        KeyType::Up => {
+            *selection = selection.saturating_sub(1);
+            *needs_render = true;
+        }
+        KeyType::Down => {
+            *selection += 1;
+            *needs_render = true;
+        }
+        KeyType::Left => {
+            *sort = SortMode::Cpu;
+            *needs_sample = true;
+        }
+        KeyType::Right => {
+            *sort = SortMode::Mem;
+            *needs_sample = true;
+        }
+        KeyType::Esc if !filter.is_empty() => {
+            filter.clear();
+            *selection = 0;
+            *needs_sample = true;
+        }
+        KeyType::Char(c) => {
+            if c == 'q' {
+                return true;
+            }
+            if c == 'j' {
+                *selection += 1;
+                *needs_render = true;
+            }
+            if c == 'k' {
+                *selection = selection.saturating_sub(1);
+                *needs_render = true;
+            }
+            if c == 'h' {
+                *sort = SortMode::Cpu;
+                *needs_sample = true;
+            }
+            if c == 'l' {
+                *sort = SortMode::Mem;
+                *needs_sample = true;
+            }
+            if c == '/' {
+                *is_search = true;
+                filter.clear();
+                *needs_render = true;
+            }
+        }
+        _ => {}
+    }
+    false
 }
 
 fn main() {
@@ -1988,6 +2295,8 @@ fn main() {
     let mut cpus = String::new();
     let mut needs_sample = true;
     let mut needs_render = true;
+    #[cfg(target_os = "windows")]
+    let mut needs_vt_size_query = true;
 
     let mut cpu_temp = -1000.0;
     let mut cpu_freq = 0.0;
@@ -2006,6 +2315,8 @@ fn main() {
         }
 
         if needs_render && now.duration_since(last_render) >= Duration::from_millis(16) {
+            #[cfg(target_os = "windows")]
+            refresh_terminal_size_if_needed(&mut needs_vt_size_query);
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let (term_height, term_width) = {
                 let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
@@ -2015,17 +2326,7 @@ fn main() {
                 (h, w)
             };
             #[cfg(target_os = "windows")]
-            let (term_height, term_width) = {
-                let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
-                let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-                if unsafe { GetConsoleScreenBufferInfo(h, &mut csbi) } != 0 {
-                    let w = (csbi.srWindow.Right - csbi.srWindow.Left + 1) as usize;
-                    let h = (csbi.srWindow.Bottom - csbi.srWindow.Top + 1) as u16;
-                    (h, w)
-                } else {
-                    (24u16, 80usize)
-                }
-            };
+            let (term_height, term_width) = terminal_dimensions();
             let mut row = 1_u16;
 
             let _ = write!(out, "\x1B[H");
@@ -2096,19 +2397,15 @@ fn main() {
             let cpu_hdr = if sort == SortMode::Cpu { "CPU%▼" } else { "CPU%" };
             let mem_hdr = if sort == SortMode::Mem { "MEM▼" } else { "MEM" };
 
-            let sort_extra = (if sort == SortMode::Cpu { 2isize } else { 0 }) + (if sort == SortMode::Mem { 2 } else { 0 });
-            let name_w = (term_width as isize - (pid_w as isize + cpu_w as isize + mem_w as isize + thr_w as isize + 9 + sort_extra)).max(12) as usize;
-
             let w1 = cpu_w + if sort == SortMode::Cpu { 2 } else { 0 };
             let w2 = mem_w + if sort == SortMode::Mem { 2 } else { 0 };
+            let name_w = (term_width as isize - pid_w as isize - w1 as isize - w2 as isize - thr_w as isize - 4)
+                .max(12) as usize;
 
             draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_SECTION), format_args!("{:<pid_w$} {:<name_w$} {:>w1$} {:>w2$} {:>thr_w$}", "PID", "NAME", cpu_hdr, mem_hdr, "THR",
                 pid_w=pid_w, name_w=name_w, w1=w1, w2=w2, thr_w=thr_w));
 
-            let max_dashes = term_width;
-            let req_dashes = pid_w + name_w + cpu_w + mem_w + thr_w + 4;
-            let num_dashes = max_dashes.min(req_dashes);
-            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("{}", "-".repeat(num_dashes)));
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("{}", "-".repeat(term_width)));
 
             let visible = term_height.saturating_sub(row) as usize;
             let count = sampler.procs.len();
@@ -2142,86 +2439,59 @@ fn main() {
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let has_input = {
+        {
             let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
-            (unsafe { libc::poll(&mut pfd, 1, 10) }) > 0
-        };
-        #[cfg(target_os = "windows")]
-        let has_input = unsafe { WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE), 10) == 0 };
-
-        if has_input {
-            loop {
-                let k = read_key();
-                match k {
-                    KeyType::None => break,
-                    KeyType::Quit => { return; }
-                    _ => {
-                        if is_search {
-                            match k {
-                                KeyType::Esc => {
-                                    is_search = false;
-                                    filter.clear();
-                                    needs_sample = true;
-                                    needs_render = true;
-                                }
-                                KeyType::Enter => {
-                                    is_search = false;
-                                    needs_render = true;
-                                }
-                                KeyType::Backspace => {
-                                    if !filter.is_empty() {
-                                        filter.pop();
-                                        selection = 0;
-                                        needs_sample = true;
-                                    } else {
-                                        is_search = false;
-                                        needs_render = true;
-                                    }
-                                }
-                                KeyType::Char(c)
-                                    if filter.len() < 63 => {
-                                        filter.push(c);
-                                        selection = 0;
-                                        needs_sample = true;
-                                    }
-                                _ => {}
-                            }
-                        } else {
-                            match k {
-                                KeyType::Up => {
-                                    selection = selection.saturating_sub(1);
-                                    needs_render = true;
-                                }
-                                KeyType::Down => {
-                                    selection += 1;
-                                    needs_render = true;
-                                }
-                                KeyType::Left => {
-                                    sort = SortMode::Cpu;
-                                    needs_sample = true;
-                                }
-                                KeyType::Right => {
-                                    sort = SortMode::Mem;
-                                    needs_sample = true;
-                                }
-                                KeyType::Esc
-                                    if !filter.is_empty() => {
-                                        filter.clear();
-                                        selection = 0;
-                                        needs_sample = true;
-                                    }
-                                KeyType::Char(c) => {
-                                    if c == 'q' { return; }
-                                    if c == 'j' { selection += 1; needs_render = true; }
-                                    if c == 'k' { selection = selection.saturating_sub(1); needs_render = true; }
-                                    if c == 'h' { sort = SortMode::Cpu; needs_sample = true; }
-                                    if c == 'l' { sort = SortMode::Mem; needs_sample = true; }
-                                    if c == '/' { is_search = true; filter.clear(); needs_render = true; }
-                                }
-                                _ => {}
+            if unsafe { libc::poll(&mut pfd, 1, 10) } > 0 {
+                loop {
+                    let k = read_key();
+                    match k {
+                        KeyType::None => break,
+                        KeyType::Quit => { return; }
+                        _ => {
+                            if handle_key(
+                                k,
+                                &mut is_search,
+                                &mut filter,
+                                &mut selection,
+                                &mut sort,
+                                &mut needs_sample,
+                                &mut needs_render,
+                            ) {
+                                return;
                             }
                         }
                     }
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let events = poll_console_events();
+            if events.is_empty() {
+                unsafe { WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE), 10); }
+            }
+            for ev in events {
+                match ev {
+                    ConsoleEvent::Resize => {
+                        needs_vt_size_query = true;
+                        needs_render = true;
+                    }
+                    ConsoleEvent::Key(k) => match k {
+                        KeyType::Quit => return,
+                        key => {
+                            if handle_key(
+                                key,
+                                &mut is_search,
+                                &mut filter,
+                                &mut selection,
+                                &mut sort,
+                                &mut needs_sample,
+                                &mut needs_render,
+                            ) {
+                                return;
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -2257,6 +2527,32 @@ mod tests {
         assert!(rendered.contains(STYLE_OK));
         assert!(rendered.contains("abc"));
         assert!(!rendered.contains("abcd"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_parse_terminal_size_response() {
+        assert_eq!(
+            parse_terminal_size_response("\x1b[8;45;132t"),
+            Some((45, 132))
+        );
+        assert_eq!(parse_terminal_size_response("[8;30;100t"), Some((30, 100)));
+        assert_eq!(parse_terminal_size_response("invalid"), None);
+    }
+
+    #[test]
+    fn test_format_to_width_pads_short_lines() {
+        assert_eq!(format_to_width(format_args!("hi"), 5), "hi   ");
+        assert_eq!(format_to_width(format_args!("hello"), 5), "hello");
+        assert_eq!(format_to_width(format_args!("abcdef"), 3), "abc");
+    }
+
+    #[test]
+    fn test_styled_line_pads_to_terminal_width() {
+        let mut out = Vec::new();
+        draw_line_with_style(&mut out, 1, 6, true, STYLE_NONE, format_args!("abc")).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("abc   "));
     }
 
     #[test]
