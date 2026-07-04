@@ -475,6 +475,82 @@ fn draw_next_line_with_style<W: Write>(
     *row = (*row).saturating_add(1);
 }
 
+struct ProcessTableLayout {
+    table_start_row: u16,
+    visible_rows: usize,
+    term_height: u16,
+    term_width: usize,
+    pid_w: usize,
+    name_w: usize,
+    w1: usize,
+    w2: usize,
+    thr_w: usize,
+}
+
+fn sync_selection_by_pid(selection: &mut usize, selected_pid: &mut Option<i32>, procs: &[ProcessInfo]) {
+    if let Some(pid) = *selected_pid {
+        if let Some(idx) = procs.iter().position(|p| p.pid == pid) {
+            *selection = idx;
+            return;
+        }
+    }
+    let count = procs.len();
+    if count == 0 {
+        *selection = 0;
+        *selected_pid = None;
+        return;
+    }
+    if *selection >= count {
+        *selection = count - 1;
+    }
+    *selected_pid = Some(procs[*selection].pid);
+}
+
+fn process_row_y(layout: &ProcessTableLayout, scroll_top: usize, index: usize) -> Option<u16> {
+    if index < scroll_top {
+        return None;
+    }
+    let offset = index - scroll_top;
+    if offset >= layout.visible_rows {
+        return None;
+    }
+    Some(layout.table_start_row.saturating_add(offset as u16))
+}
+
+fn paint_process_row<W: Write>(
+    out: &mut W,
+    row: u16,
+    term_width: usize,
+    layout: &ProcessTableLayout,
+    p: &ProcessInfo,
+    selected: bool,
+    mem_total: u64,
+    colours: bool,
+) {
+    let p_name = clip_to_width(&p.name, layout.name_w);
+    let row_style = process_row_style(p.cpu_percent, p.mem_bytes, mem_total, colours);
+    let _ = draw_line_with_style(
+        out,
+        row,
+        term_width,
+        selected,
+        row_style,
+        format_args!(
+            "{:<pid_w$} {:<name_w$} {:>w1$.1} {:>w2$} {:>thr_w$}",
+            p.pid,
+            p_name,
+            p.cpu_percent,
+            human_bytes(p.mem_bytes),
+            p.threads,
+            pid_w = layout.pid_w,
+            name_w = layout.name_w,
+            w1 = layout.w1,
+            w2 = layout.w2,
+            thr_w = layout.thr_w,
+        ),
+    );
+}
+
 #[cfg(target_os = "macos")]
 fn sysctl_into<T>(name: &str, value: &mut T) -> bool {
     let Ok(name) = CString::new(name) else { return false; };
@@ -2175,6 +2251,8 @@ fn handle_key(
     sort: &mut SortMode,
     needs_sample: &mut bool,
     needs_render: &mut bool,
+    needs_full_render: &mut bool,
+    last_scroll: &mut Instant,
 ) -> bool {
     if *is_search {
         match k {
@@ -2183,25 +2261,30 @@ fn handle_key(
                 filter.clear();
                 *needs_sample = true;
                 *needs_render = true;
+                *needs_full_render = true;
             }
             KeyType::Enter => {
                 *is_search = false;
                 *needs_render = true;
+                *needs_full_render = true;
             }
             KeyType::Backspace => {
                 if !filter.is_empty() {
                     filter.pop();
                     *selection = 0;
                     *needs_sample = true;
+                    *needs_full_render = true;
                 } else {
                     *is_search = false;
                     *needs_render = true;
+                    *needs_full_render = true;
                 }
             }
             KeyType::Char(c) if filter.len() < 63 => {
                 filter.push(c);
                 *selection = 0;
                 *needs_sample = true;
+                *needs_full_render = true;
             }
             _ => {}
         }
@@ -2211,24 +2294,29 @@ fn handle_key(
     match k {
         KeyType::Up => {
             *selection = selection.saturating_sub(1);
+            *last_scroll = Instant::now();
             *needs_render = true;
         }
         KeyType::Down => {
             *selection += 1;
+            *last_scroll = Instant::now();
             *needs_render = true;
         }
         KeyType::Left => {
             *sort = SortMode::Cpu;
             *needs_sample = true;
+            *needs_full_render = true;
         }
         KeyType::Right => {
             *sort = SortMode::Mem;
             *needs_sample = true;
+            *needs_full_render = true;
         }
         KeyType::Esc if !filter.is_empty() => {
             filter.clear();
             *selection = 0;
             *needs_sample = true;
+            *needs_full_render = true;
         }
         KeyType::Char(c) => {
             if c == 'q' {
@@ -2236,24 +2324,29 @@ fn handle_key(
             }
             if c == 'j' {
                 *selection += 1;
+                *last_scroll = Instant::now();
                 *needs_render = true;
             }
             if c == 'k' {
                 *selection = selection.saturating_sub(1);
+                *last_scroll = Instant::now();
                 *needs_render = true;
             }
             if c == 'h' {
                 *sort = SortMode::Cpu;
                 *needs_sample = true;
+                *needs_full_render = true;
             }
             if c == 'l' {
                 *sort = SortMode::Mem;
                 *needs_sample = true;
+                *needs_full_render = true;
             }
             if c == '/' {
                 *is_search = true;
                 filter.clear();
                 *needs_render = true;
+                *needs_full_render = true;
             }
         }
         _ => {}
@@ -2279,10 +2372,12 @@ fn main() {
     let mut filter = String::new();
     let mut is_search = false;
     let mut selection = 0_usize;
+    let mut selected_pid: Option<i32> = None;
     let colours = colour_enabled();
 
     let mut last_sample = Instant::now();
     let mut last_render = Instant::now();
+    let mut last_scroll = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
     let mut out = BufWriter::with_capacity(16384, io::stdout());
     let mut cpu = 0.0;
@@ -2295,26 +2390,183 @@ fn main() {
     let mut cpus = String::new();
     let mut needs_sample = true;
     let mut needs_render = true;
+    let mut needs_full_render = true;
+    let mut process_layout: Option<ProcessTableLayout> = None;
+    let mut last_painted_selection = 0_usize;
+    let mut last_painted_scroll_top = 0_usize;
     #[cfg(target_os = "windows")]
     let mut needs_vt_size_query = true;
 
     let mut cpu_temp = -1000.0;
     let mut cpu_freq = 0.0;
 
+    const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+    const SCROLL_SAMPLE_DELAY: Duration = Duration::from_millis(250);
+
     loop {
         if QUIT.load(AtomicOrdering::SeqCst) { break; }
         let now = Instant::now();
 
-        if now.duration_since(last_sample) >= Duration::from_millis(500) || needs_sample {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
+                while let Some(k) = read_key() {
+                    if k == KeyType::Quit {
+                        return;
+                    }
+                    if handle_key(
+                        k,
+                        &mut is_search,
+                        &mut filter,
+                        &mut selection,
+                        &mut sort,
+                        &mut needs_sample,
+                        &mut needs_render,
+                        &mut needs_full_render,
+                        &mut last_scroll,
+                    ) {
+                        return;
+                    }
+                    if let Some(p) = sampler.procs.get(selection) {
+                        selected_pid = Some(p.pid);
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let events = poll_console_events();
+            for ev in events {
+                match ev {
+                    ConsoleEvent::Resize => {
+                        needs_vt_size_query = true;
+                        needs_render = true;
+                        needs_full_render = true;
+                    }
+                    ConsoleEvent::Key(k) => match k {
+                        KeyType::Quit => return,
+                        key => {
+                            if handle_key(
+                                key,
+                                &mut is_search,
+                                &mut filter,
+                                &mut selection,
+                                &mut sort,
+                                &mut needs_sample,
+                                &mut needs_render,
+                                &mut needs_full_render,
+                                &mut last_scroll,
+                            ) {
+                                return;
+                            }
+                            if let Some(p) = sampler.procs.get(selection) {
+                                selected_pid = Some(p.pid);
+                            }
+                        }
+                    },
+                }
+            }
+        }
+
+        let sample_due = now.duration_since(last_sample) >= SAMPLE_INTERVAL || needs_sample;
+        let scroll_quiet = now.duration_since(last_scroll) >= SCROLL_SAMPLE_DELAY;
+        if sample_due && (needs_sample || scroll_quiet) {
             sample(&mut sampler, sort, &filter, &mut cpu, &mut mem, &mut net, &mut gpu, &mut storage, &mut cpus, &mut cached_gpu, &mut last_gpu_read);
             cpu_temp = read_cpu_temp(&mut sampler.cpu_temp_path);
             cpu_freq = read_cpu_freq(&mut sampler.cpu_freq_paths);
-            last_sample = now;
+            sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
+            last_sample = Instant::now();
             needs_sample = false;
             needs_render = true;
+            needs_full_render = true;
         }
 
-        if needs_render && now.duration_since(last_render) >= Duration::from_millis(16) {
+        if needs_render
+            && !needs_full_render
+            && now.duration_since(last_render) >= Duration::from_millis(16)
+            && let Some(layout) = process_layout.as_ref()
+        {
+            let count = sampler.procs.len();
+            sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
+            let visible = layout.visible_rows;
+            let mut scroll_top = selection.saturating_sub(visible / 2);
+            if scroll_top > count.saturating_sub(visible) {
+                scroll_top = count.saturating_sub(visible);
+            }
+
+            if scroll_top == last_painted_scroll_top && last_painted_selection != selection {
+                if let Some(old_row) = process_row_y(layout, scroll_top, last_painted_selection)
+                    && let Some(p) = sampler.procs.get(last_painted_selection)
+                {
+                    paint_process_row(
+                        &mut out,
+                        old_row,
+                        layout.term_width,
+                        layout,
+                        p,
+                        false,
+                        mem.total_bytes,
+                        colours,
+                    );
+                }
+                if let Some(new_row) = process_row_y(layout, scroll_top, selection)
+                    && let Some(p) = sampler.procs.get(selection)
+                {
+                    paint_process_row(
+                        &mut out,
+                        new_row,
+                        layout.term_width,
+                        layout,
+                        p,
+                        true,
+                        mem.total_bytes,
+                        colours,
+                    );
+                }
+                let _ = out.flush();
+                last_painted_selection = selection;
+                last_render = Instant::now();
+                needs_render = false;
+            } else if scroll_top != last_painted_scroll_top {
+                for i in scroll_top..count.min(scroll_top + visible) {
+                    if let Some(row) = process_row_y(layout, scroll_top, i)
+                        && let Some(p) = sampler.procs.get(i)
+                    {
+                        paint_process_row(
+                            &mut out,
+                            row,
+                            layout.term_width,
+                            layout,
+                            p,
+                            i == selection,
+                            mem.total_bytes,
+                            colours,
+                        );
+                    }
+                }
+                if count > 0 {
+                    let end_idx = count.min(scroll_top + visible);
+                    let _ = draw_line_with_style(
+                        &mut out,
+                        layout.term_height,
+                        layout.term_width,
+                        false,
+                        colour(colours, STYLE_MUTED),
+                        format_args!("Showing {}-{} of {}", scroll_top + 1, end_idx, count),
+                    );
+                }
+                let _ = out.flush();
+                last_painted_scroll_top = scroll_top;
+                last_painted_selection = selection;
+                last_render = Instant::now();
+                needs_render = false;
+            } else {
+                needs_full_render = true;
+            }
+        }
+
+        if needs_render && needs_full_render && now.duration_since(last_render) >= Duration::from_millis(16) {
             #[cfg(target_os = "windows")]
             refresh_terminal_size_if_needed(&mut needs_vt_size_query);
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2409,23 +2661,36 @@ fn main() {
 
             let visible = term_height.saturating_sub(row) as usize;
             let count = sampler.procs.len();
-            if selection >= count && count > 0 { selection = count - 1; }
-            if count == 0 { selection = 0; }
-
+            sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
             let mut scroll_top = selection.saturating_sub(visible / 2);
             if scroll_top > count.saturating_sub(visible) { scroll_top = count.saturating_sub(visible); }
 
+            let table_start_row = row;
+            let layout = ProcessTableLayout {
+                table_start_row,
+                visible_rows: visible,
+                term_height,
+                term_width,
+                pid_w,
+                name_w,
+                w1,
+                w2,
+                thr_w,
+            };
+
             for i in scroll_top..count.min(scroll_top + visible) {
                 let p = &sampler.procs[i];
-                let mut p_name = p.name.clone();
-                if p_name.chars().count() > name_w {
-                    p_name = p_name.chars().take(name_w).collect();
-                }
-
-                let row_style = process_row_style(p.cpu_percent, p.mem_bytes, mem.total_bytes, colours);
-                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, i == selection, row_style, format_args!("{:<pid_w$} {:<name_w$} {:>w1$.1} {:>mem_w$} {:>thr_w$}",
-                    p.pid, p_name, p.cpu_percent, human_bytes(p.mem_bytes), p.threads,
-                    pid_w=pid_w, name_w=name_w, w1=w1, mem_w=w2, thr_w=thr_w));
+                paint_process_row(
+                    &mut out,
+                    table_start_row.saturating_add((i - scroll_top) as u16),
+                    term_width,
+                    &layout,
+                    p,
+                    i == selection,
+                    mem.total_bytes,
+                    colours,
+                );
+                row = row.saturating_add(1);
             }
             let clear_row = row.min(term_height);
             let _ = write!(out, "\x1B[{};1H\x1B[J", clear_row);
@@ -2434,62 +2699,24 @@ fn main() {
                 let _ = draw_line_with_style(&mut out, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("Showing {}-{} of {}", scroll_top + 1, end_idx, count));
             }
             let _ = out.flush();
-            last_render = now;
+            process_layout = Some(layout);
+            last_painted_selection = selection;
+            last_painted_scroll_top = scroll_top;
+            last_render = Instant::now();
             needs_render = false;
+            needs_full_render = false;
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
-            if unsafe { libc::poll(&mut pfd, 1, 10) } > 0 {
-                while let Some(k) = read_key() {
-                    if k == KeyType::Quit {
-                        return;
-                    }
-                    if handle_key(
-                        k,
-                        &mut is_search,
-                        &mut filter,
-                        &mut selection,
-                        &mut sort,
-                        &mut needs_sample,
-                        &mut needs_render,
-                    ) {
-                        return;
-                    }
-                }
+            if unsafe { libc::poll(&mut pfd, 1, 10) } <= 0 {
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         #[cfg(target_os = "windows")]
         {
-            let events = poll_console_events();
-            if events.is_empty() {
-                unsafe { WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE), 10); }
-            }
-            for ev in events {
-                match ev {
-                    ConsoleEvent::Resize => {
-                        needs_vt_size_query = true;
-                        needs_render = true;
-                    }
-                    ConsoleEvent::Key(k) => match k {
-                        KeyType::Quit => return,
-                        key => {
-                            if handle_key(
-                                key,
-                                &mut is_search,
-                                &mut filter,
-                                &mut selection,
-                                &mut sort,
-                                &mut needs_sample,
-                                &mut needs_render,
-                            ) {
-                                return;
-                            }
-                        }
-                    },
-                }
-            }
+            unsafe { WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE), 10); }
         }
     }
 }
@@ -2534,6 +2761,27 @@ mod tests {
         );
         assert_eq!(parse_terminal_size_response("[8;30;100t"), Some((30, 100)));
         assert_eq!(parse_terminal_size_response("invalid"), None);
+    }
+
+    #[test]
+    fn test_sync_selection_by_pid_follows_process_after_sort() {
+        let procs = vec![
+            ProcessInfo { pid: 10, name: "a".into(), cpu_percent: 5.0, mem_bytes: 0, threads: 1 },
+            ProcessInfo { pid: 20, name: "b".into(), cpu_percent: 1.0, mem_bytes: 0, threads: 1 },
+        ];
+        let mut selection = 1;
+        let mut selected_pid = Some(20);
+        sync_selection_by_pid(&mut selection, &mut selected_pid, &procs);
+        assert_eq!(selection, 1);
+        assert_eq!(selected_pid, Some(20));
+
+        let reordered = vec![
+            ProcessInfo { pid: 20, name: "b".into(), cpu_percent: 9.0, mem_bytes: 0, threads: 1 },
+            ProcessInfo { pid: 10, name: "a".into(), cpu_percent: 1.0, mem_bytes: 0, threads: 1 },
+        ];
+        sync_selection_by_pid(&mut selection, &mut selected_pid, &reordered);
+        assert_eq!(selection, 0);
+        assert_eq!(selected_pid, Some(20));
     }
 
     #[test]
