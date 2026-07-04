@@ -1901,7 +1901,7 @@ fn sample(
 }
 
 enum KeyType {
-    None, Quit, Up, Down, Left, Right, Backspace, Enter, Esc, Char(char),
+    Quit, Up, Down, Left, Right, Backspace, Enter, Esc, Char(char),
 }
 
 #[cfg(target_os = "windows")]
@@ -2143,26 +2143,26 @@ fn parse_key_event(ke: KEY_EVENT_RECORD) -> Option<KeyType> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_key() -> KeyType {
+fn read_key() -> Option<KeyType> {
     let mut buf = [0u8; 16];
     let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n <= 0 { return KeyType::None; }
+    if n <= 0 { return None; }
     let n = n as usize;
 
-    if buf[0] == 3 { return KeyType::Quit; }
+    if buf[0] == 3 { return Some(KeyType::Quit); }
 
     if n == 1 {
-        if buf[0] == 27 { return KeyType::Esc; }
-        if buf[0] == 127 || buf[0] == 8 { return KeyType::Backspace; }
-        if buf[0] == 10 || buf[0] == 13 { return KeyType::Enter; }
-        if buf[0].is_ascii_graphic() || buf[0] == b' ' { return KeyType::Char(buf[0] as char); }
+        if buf[0] == 27 { return Some(KeyType::Esc); }
+        if buf[0] == 127 || buf[0] == 8 { return Some(KeyType::Backspace); }
+        if buf[0] == 10 || buf[0] == 13 { return Some(KeyType::Enter); }
+        if buf[0].is_ascii_graphic() || buf[0] == b' ' { return Some(KeyType::Char(buf[0] as char)); }
     } else if n >= 3 && buf[0] == 27 && buf[1] == b'[' {
-        if buf[2] == b'A' { return KeyType::Up; }
-        if buf[2] == b'B' { return KeyType::Down; }
-        if buf[2] == b'C' { return KeyType::Right; }
-        if buf[2] == b'D' { return KeyType::Left; }
+        if buf[2] == b'A' { return Some(KeyType::Up); }
+        if buf[2] == b'B' { return Some(KeyType::Down); }
+        if buf[2] == b'C' { return Some(KeyType::Right); }
+        if buf[2] == b'D' { return Some(KeyType::Left); }
     }
-    KeyType::None
+    None
 }
 
 
@@ -2442,24 +2442,20 @@ fn main() {
         {
             let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
             if unsafe { libc::poll(&mut pfd, 1, 10) } > 0 {
-                loop {
-                    let k = read_key();
-                    match k {
-                        KeyType::None => break,
-                        KeyType::Quit => { return; }
-                        _ => {
-                            if handle_key(
-                                k,
-                                &mut is_search,
-                                &mut filter,
-                                &mut selection,
-                                &mut sort,
-                                &mut needs_sample,
-                                &mut needs_render,
-                            ) {
-                                return;
-                            }
-                        }
+                while let Some(k) = read_key() {
+                    if k == KeyType::Quit {
+                        return;
+                    }
+                    if handle_key(
+                        k,
+                        &mut is_search,
+                        &mut filter,
+                        &mut selection,
+                        &mut sort,
+                        &mut needs_sample,
+                        &mut needs_render,
+                    ) {
+                        return;
                     }
                 }
             }
