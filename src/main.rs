@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use windows_sys::core::BOOL;
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, TRUE, FILETIME, CloseHandle};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Console::{
@@ -26,6 +27,7 @@ use windows_sys::Win32::System::Console::{
     ENABLE_WINDOW_INPUT,
     SetConsoleCtrlHandler,
     ReadConsoleInputW, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT_RECORD,
+    WINDOW_BUFFER_SIZE_EVENT,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{
@@ -330,6 +332,15 @@ fn clip_to_width(line: &str, width: usize) -> String {
     line.chars().take(width).collect()
 }
 
+fn format_to_width(args: fmt::Arguments<'_>, width: usize) -> String {
+    let clipped = clip_to_width(&args.to_string(), width);
+    if clipped.chars().count() < width {
+        format!("{:<width$}", clipped, width = width)
+    } else {
+        clipped
+    }
+}
+
 const STYLE_NONE: &str = "";
 const STYLE_TITLE: &str = "\x1B[1m\x1B[38;5;51m";
 const STYLE_SECTION: &str = "\x1B[1m\x1B[38;5;45m";
@@ -418,11 +429,11 @@ fn draw_line_with_style<W: Write>(
     style: &str,
     args: fmt::Arguments<'_>,
 ) -> io::Result<()> {
-    let line = clip_to_width(&args.to_string(), width);
+    let line = format_to_width(args, width);
     if reverse {
-        write!(out, "\x1B[{};1H\x1B[0m\x1B[7m{}\x1B[0m\x1B[K", row, line)
+        write!(out, "\x1B[{};1H\x1B[0m\x1B[7m{}\x1B[0m", row, line)
     } else {
-        write!(out, "\x1B[{};1H\x1B[0m{}{}\x1B[0m\x1B[K", row, style, line)
+        write!(out, "\x1B[{};1H\x1B[0m{}{}\x1B[0m", row, style, line)
     }
 }
 
@@ -463,6 +474,82 @@ fn draw_next_line_with_style<W: Write>(
         let _ = draw_line_with_style(out, *row, width, reverse, style, args);
     }
     *row = (*row).saturating_add(1);
+}
+
+struct ProcessTableLayout {
+    table_start_row: u16,
+    visible_rows: usize,
+    term_height: u16,
+    term_width: usize,
+    pid_w: usize,
+    name_w: usize,
+    w1: usize,
+    w2: usize,
+    thr_w: usize,
+}
+
+fn sync_selection_by_pid(selection: &mut usize, selected_pid: &mut Option<i32>, procs: &[ProcessInfo]) {
+    if let Some(pid) = *selected_pid {
+        if let Some(idx) = procs.iter().position(|p| p.pid == pid) {
+            *selection = idx;
+            return;
+        }
+    }
+    let count = procs.len();
+    if count == 0 {
+        *selection = 0;
+        *selected_pid = None;
+        return;
+    }
+    if *selection >= count {
+        *selection = count - 1;
+    }
+    *selected_pid = Some(procs[*selection].pid);
+}
+
+fn process_row_y(layout: &ProcessTableLayout, scroll_top: usize, index: usize) -> Option<u16> {
+    if index < scroll_top {
+        return None;
+    }
+    let offset = index - scroll_top;
+    if offset >= layout.visible_rows {
+        return None;
+    }
+    Some(layout.table_start_row.saturating_add(offset as u16))
+}
+
+fn paint_process_row<W: Write>(
+    out: &mut W,
+    row: u16,
+    term_width: usize,
+    layout: &ProcessTableLayout,
+    p: &ProcessInfo,
+    selected: bool,
+    mem_total: u64,
+    colours: bool,
+) {
+    let p_name = clip_to_width(&p.name, layout.name_w);
+    let row_style = process_row_style(p.cpu_percent, p.mem_bytes, mem_total, colours);
+    let _ = draw_line_with_style(
+        out,
+        row,
+        term_width,
+        selected,
+        row_style,
+        format_args!(
+            "{:<pid_w$} {:<name_w$} {:>w1$.1} {:>w2$} {:>thr_w$}",
+            p.pid,
+            p_name,
+            p.cpu_percent,
+            human_bytes(p.mem_bytes),
+            p.threads,
+            pid_w = layout.pid_w,
+            name_w = layout.name_w,
+            w1 = layout.w1,
+            w2 = layout.w2,
+            thr_w = layout.thr_w,
+        ),
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1890,68 +1977,381 @@ fn sample(
     });
 }
 
+#[derive(PartialEq)]
 enum KeyType {
-    None, Quit, Up, Down, Left, Right, Backspace, Enter, Esc, Char(char),
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_key() -> KeyType {
-    let mut buf = [0u8; 16];
-    let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n <= 0 { return KeyType::None; }
-    let n = n as usize;
-
-    if buf[0] == 3 { return KeyType::Quit; }
-
-    if n == 1 {
-        if buf[0] == 27 { return KeyType::Esc; }
-        if buf[0] == 127 || buf[0] == 8 { return KeyType::Backspace; }
-        if buf[0] == 10 || buf[0] == 13 { return KeyType::Enter; }
-        if buf[0].is_ascii_graphic() || buf[0] == b' ' { return KeyType::Char(buf[0] as char); }
-    } else if n >= 3 && buf[0] == 27 && buf[1] == b'[' {
-        if buf[2] == b'A' { return KeyType::Up; }
-        if buf[2] == b'B' { return KeyType::Down; }
-        if buf[2] == b'C' { return KeyType::Right; }
-        if buf[2] == b'D' { return KeyType::Left; }
-    }
-    KeyType::None
+    Quit, Up, Down, Left, Right, Backspace, Enter, Esc, Char(char),
 }
 
 #[cfg(target_os = "windows")]
-fn read_key() -> KeyType {
-    let mut num_events: u32 = 0;
+enum ConsoleEvent {
+    Resize,
+    Key(KeyType),
+}
+
+#[cfg(target_os = "windows")]
+static PENDING_CONSOLE_EVENTS: std::sync::Mutex<Vec<ConsoleEvent>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_os = "windows")]
+static REPORTED_CONSOLE_SIZE: std::sync::Mutex<Option<(u16, usize)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+fn note_reported_console_size(rows: i16, cols: i16) {
+    if cols <= 0 || rows <= 0 {
+        return;
+    }
+    let size = (rows as u16, cols as usize);
+    if let Ok(mut reported) = REPORTED_CONSOLE_SIZE.lock() {
+        *reported = Some(match *reported {
+            Some((h, w)) => (h.max(size.0), w.max(size.1)),
+            None => size,
+        });
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_csbi_dimensions() -> (u16, usize) {
     unsafe {
-        let h = GetStdHandle(STD_INPUT_HANDLE);
-        // Non-blocking: return None immediately if no events pending
-        if GetNumberOfConsoleInputEvents(h, &mut num_events) == 0 || num_events == 0 {
-            return KeyType::None;
+        let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if GetConsoleScreenBufferInfo(h, &mut csbi) == 0 {
+            return (24u16, 80usize);
         }
-        let mut record: INPUT_RECORD = std::mem::zeroed();
-        let mut events_read: u32 = 0;
-        if ReadConsoleInputW(h, &mut record, 1, &mut events_read) == 0 || events_read == 0 {
-            return KeyType::None;
-        }
-        if record.EventType != 1 /* KEY_EVENT */ { return KeyType::None; }
-        let ke: KEY_EVENT_RECORD = record.Event.KeyEvent;
-        if ke.bKeyDown == 0 { return KeyType::None; }
-        let ch = ke.uChar.UnicodeChar;
-        if ch != 0 {
-            let byte = ch as u8;
-            if byte == 3 { return KeyType::Quit; }
-            if byte == 27 { return KeyType::Esc; }
-            if byte == 127 || byte == 8 { return KeyType::Backspace; }
-            if byte == 10 || byte == 13 { return KeyType::Enter; }
-            if byte.is_ascii_graphic() || byte == b' ' { return KeyType::Char(byte as char); }
-            return KeyType::None;
-        }
-        match ke.wVirtualKeyCode {
-            0x26 /* VK_UP */ => KeyType::Up,
-            0x28 /* VK_DOWN */ => KeyType::Down,
-            0x25 /* VK_LEFT */ => KeyType::Left,
-            0x27 /* VK_RIGHT */ => KeyType::Right,
-            _ => KeyType::None,
+        let window_w = (csbi.srWindow.Right - csbi.srWindow.Left + 1).max(1) as usize;
+        let window_h = (csbi.srWindow.Bottom - csbi.srWindow.Top + 1).max(1) as u16;
+        (window_h, window_w)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_terminal_size_response(response: &str) -> Option<(u16, usize)> {
+    let body = response
+        .trim_start_matches('\x1b')
+        .trim_start_matches('[')
+        .strip_prefix("8;")?;
+    let (rows, cols) = body.strip_suffix('t')?.split_once(';')?;
+    let h: u16 = rows.parse().ok()?;
+    let w: usize = cols.parse().ok()?;
+    (h > 0 && w > 0).then_some((h, w))
+}
+
+#[cfg(target_os = "windows")]
+fn query_terminal_size_vt() -> Option<(u16, usize)> {
+    let _ = io::stdout().write_all(b"\x1b[18t");
+    let _ = io::stdout().flush();
+
+    let mut response = String::new();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    unsafe {
+        let stdin = GetStdHandle(STD_INPUT_HANDLE);
+        while Instant::now() < deadline {
+            if WaitForSingleObject(stdin, 5) != 0 {
+                continue;
+            }
+            let mut num_events: u32 = 0;
+            if GetNumberOfConsoleInputEvents(stdin, &mut num_events) == 0 || num_events == 0 {
+                continue;
+            }
+            let mut record: INPUT_RECORD = std::mem::zeroed();
+            let mut events_read: u32 = 0;
+            if ReadConsoleInputW(stdin, &mut record, 1, &mut events_read) == 0 || events_read == 0 {
+                break;
+            }
+            if record.EventType as u32 != 1 {
+                continue;
+            }
+            let ke = record.Event.KeyEvent;
+            if ke.bKeyDown == 0 {
+                continue;
+            }
+            let ch = ke.uChar.UnicodeChar;
+            if ch == 27 {
+                response.clear();
+                response.push('\x1b');
+                continue;
+            }
+            if ch == 0 {
+                continue;
+            }
+            if let Some(c) = char::from_u32(ch as u32) {
+                response.push(c);
+                if c == 't' && response.contains(';') {
+                    break;
+                }
+            }
+            if response.len() > 32 {
+                break;
+            }
         }
     }
+
+    parse_terminal_size_response(&response).inspect(|&(h, w)| note_reported_console_size(h as i16, w as i16))
+}
+
+#[cfg(target_os = "windows")]
+fn terminal_dimensions() -> (u16, usize) {
+    drain_resize_events();
+    let (mut height, mut width) = read_csbi_dimensions();
+    if let Ok(reported) = REPORTED_CONSOLE_SIZE.lock() {
+        if let Some((h, w)) = *reported {
+            height = height.max(h);
+            width = width.max(w);
+        }
+    }
+    (height, width)
+}
+
+#[cfg(target_os = "windows")]
+fn refresh_terminal_size_if_needed(needs_vt_size_query: &mut bool) {
+    if !*needs_vt_size_query {
+        return;
+    }
+    let _ = query_terminal_size_vt();
+    *needs_vt_size_query = false;
+}
+
+#[cfg(target_os = "windows")]
+fn push_console_event(event: ConsoleEvent) {
+    if let Ok(mut pending) = PENDING_CONSOLE_EVENTS.lock() {
+        pending.push(event);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn drain_resize_events() {
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        loop {
+            let mut num_events: u32 = 0;
+            if GetNumberOfConsoleInputEvents(h, &mut num_events) == 0 || num_events == 0 {
+                break;
+            }
+            let mut record: INPUT_RECORD = std::mem::zeroed();
+            let mut events_read: u32 = 0;
+            if ReadConsoleInputW(h, &mut record, 1, &mut events_read) == 0 || events_read == 0 {
+                break;
+            }
+            match record.EventType as u32 {
+                WINDOW_BUFFER_SIZE_EVENT => {
+                    let size = record.Event.WindowBufferSizeEvent.dwSize;
+                    note_reported_console_size(size.Y, size.X);
+                }
+                1 /* KEY_EVENT */ => {
+                    if let Some(key) = parse_key_event(record.Event.KeyEvent) {
+                        push_console_event(ConsoleEvent::Key(key));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn poll_console_events() -> Vec<ConsoleEvent> {
+    let mut events = PENDING_CONSOLE_EVENTS
+        .lock()
+        .map(|mut pending| pending.drain(..).collect::<Vec<_>>())
+        .unwrap_or_default();
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        loop {
+            let mut num_events: u32 = 0;
+            if GetNumberOfConsoleInputEvents(h, &mut num_events) == 0 || num_events == 0 {
+                break;
+            }
+            let mut record: INPUT_RECORD = std::mem::zeroed();
+            let mut events_read: u32 = 0;
+            if ReadConsoleInputW(h, &mut record, 1, &mut events_read) == 0 || events_read == 0 {
+                break;
+            }
+            match record.EventType as u32 {
+                WINDOW_BUFFER_SIZE_EVENT => {
+                    let size = record.Event.WindowBufferSizeEvent.dwSize;
+                    note_reported_console_size(size.Y, size.X);
+                    events.push(ConsoleEvent::Resize);
+                }
+                1 /* KEY_EVENT */ => {
+                    if let Some(key) = parse_key_event(record.Event.KeyEvent) {
+                        events.push(ConsoleEvent::Key(key));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    events
+}
+
+#[cfg(target_os = "windows")]
+fn parse_key_event(ke: KEY_EVENT_RECORD) -> Option<KeyType> {
+    if ke.bKeyDown == 0 {
+        return None;
+    }
+    let ch = unsafe { ke.uChar.UnicodeChar };
+    if ch != 0 {
+        let byte = ch as u8;
+        if byte == 3 {
+            return Some(KeyType::Quit);
+        }
+        if byte == 27 {
+            return Some(KeyType::Esc);
+        }
+        if byte == 127 || byte == 8 {
+            return Some(KeyType::Backspace);
+        }
+        if byte == 10 || byte == 13 {
+            return Some(KeyType::Enter);
+        }
+        if byte.is_ascii_graphic() || byte == b' ' {
+            return Some(KeyType::Char(byte as char));
+        }
+        return None;
+    }
+    match ke.wVirtualKeyCode {
+        0x26 /* VK_UP */ => Some(KeyType::Up),
+        0x28 /* VK_DOWN */ => Some(KeyType::Down),
+        0x25 /* VK_LEFT */ => Some(KeyType::Left),
+        0x27 /* VK_RIGHT */ => Some(KeyType::Right),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_key() -> Option<KeyType> {
+    let mut buf = [0u8; 16];
+    let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n <= 0 { return None; }
+    let n = n as usize;
+
+    if buf[0] == 3 { return Some(KeyType::Quit); }
+
+    if n == 1 {
+        if buf[0] == 27 { return Some(KeyType::Esc); }
+        if buf[0] == 127 || buf[0] == 8 { return Some(KeyType::Backspace); }
+        if buf[0] == 10 || buf[0] == 13 { return Some(KeyType::Enter); }
+        if buf[0].is_ascii_graphic() || buf[0] == b' ' { return Some(KeyType::Char(buf[0] as char)); }
+    } else if n >= 3 && buf[0] == 27 && buf[1] == b'[' {
+        if buf[2] == b'A' { return Some(KeyType::Up); }
+        if buf[2] == b'B' { return Some(KeyType::Down); }
+        if buf[2] == b'C' { return Some(KeyType::Right); }
+        if buf[2] == b'D' { return Some(KeyType::Left); }
+    }
+    None
+}
+
+
+
+fn handle_key(
+    k: KeyType,
+    is_search: &mut bool,
+    filter: &mut String,
+    selection: &mut usize,
+    sort: &mut SortMode,
+    needs_sample: &mut bool,
+    needs_render: &mut bool,
+    needs_full_render: &mut bool,
+    last_scroll: &mut Instant,
+) -> bool {
+    if *is_search {
+        match k {
+            KeyType::Esc => {
+                *is_search = false;
+                filter.clear();
+                *needs_sample = true;
+                *needs_render = true;
+                *needs_full_render = true;
+            }
+            KeyType::Enter => {
+                *is_search = false;
+                *needs_render = true;
+                *needs_full_render = true;
+            }
+            KeyType::Backspace => {
+                if !filter.is_empty() {
+                    filter.pop();
+                    *selection = 0;
+                    *needs_sample = true;
+                    *needs_full_render = true;
+                } else {
+                    *is_search = false;
+                    *needs_render = true;
+                    *needs_full_render = true;
+                }
+            }
+            KeyType::Char(c) if filter.len() < 63 => {
+                filter.push(c);
+                *selection = 0;
+                *needs_sample = true;
+                *needs_full_render = true;
+            }
+            _ => {}
+        }
+        return false;
+    }
+
+    match k {
+        KeyType::Up => {
+            *selection = selection.saturating_sub(1);
+            *last_scroll = Instant::now();
+            *needs_render = true;
+        }
+        KeyType::Down => {
+            *selection += 1;
+            *last_scroll = Instant::now();
+            *needs_render = true;
+        }
+        KeyType::Left => {
+            *sort = SortMode::Cpu;
+            *needs_sample = true;
+            *needs_full_render = true;
+        }
+        KeyType::Right => {
+            *sort = SortMode::Mem;
+            *needs_sample = true;
+            *needs_full_render = true;
+        }
+        KeyType::Esc if !filter.is_empty() => {
+            filter.clear();
+            *selection = 0;
+            *needs_sample = true;
+            *needs_full_render = true;
+        }
+        KeyType::Char(c) => {
+            if c == 'q' {
+                return true;
+            }
+            if c == 'j' {
+                *selection += 1;
+                *last_scroll = Instant::now();
+                *needs_render = true;
+            }
+            if c == 'k' {
+                *selection = selection.saturating_sub(1);
+                *last_scroll = Instant::now();
+                *needs_render = true;
+            }
+            if c == 'h' {
+                *sort = SortMode::Cpu;
+                *needs_sample = true;
+                *needs_full_render = true;
+            }
+            if c == 'l' {
+                *sort = SortMode::Mem;
+                *needs_sample = true;
+                *needs_full_render = true;
+            }
+            if c == '/' {
+                *is_search = true;
+                filter.clear();
+                *needs_render = true;
+                *needs_full_render = true;
+            }
+        }
+        _ => {}
+    }
+    false
 }
 
 fn main() {
@@ -1972,10 +2372,12 @@ fn main() {
     let mut filter = String::new();
     let mut is_search = false;
     let mut selection = 0_usize;
+    let mut selected_pid: Option<i32> = None;
     let colours = colour_enabled();
 
     let mut last_sample = Instant::now();
     let mut last_render = Instant::now();
+    let mut last_scroll = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
     let mut out = BufWriter::with_capacity(16384, io::stdout());
     let mut cpu = 0.0;
@@ -1988,24 +2390,185 @@ fn main() {
     let mut cpus = String::new();
     let mut needs_sample = true;
     let mut needs_render = true;
+    let mut needs_full_render = true;
+    let mut process_layout: Option<ProcessTableLayout> = None;
+    let mut last_painted_selection = 0_usize;
+    let mut last_painted_scroll_top = 0_usize;
+    #[cfg(target_os = "windows")]
+    let mut needs_vt_size_query = true;
 
     let mut cpu_temp = -1000.0;
     let mut cpu_freq = 0.0;
+
+    const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+    const SCROLL_SAMPLE_DELAY: Duration = Duration::from_millis(250);
 
     loop {
         if QUIT.load(AtomicOrdering::SeqCst) { break; }
         let now = Instant::now();
 
-        if now.duration_since(last_sample) >= Duration::from_millis(500) || needs_sample {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
+                while let Some(k) = read_key() {
+                    if k == KeyType::Quit {
+                        return;
+                    }
+                    if handle_key(
+                        k,
+                        &mut is_search,
+                        &mut filter,
+                        &mut selection,
+                        &mut sort,
+                        &mut needs_sample,
+                        &mut needs_render,
+                        &mut needs_full_render,
+                        &mut last_scroll,
+                    ) {
+                        return;
+                    }
+                    if let Some(p) = sampler.procs.get(selection) {
+                        selected_pid = Some(p.pid);
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let events = poll_console_events();
+            for ev in events {
+                match ev {
+                    ConsoleEvent::Resize => {
+                        needs_vt_size_query = true;
+                        needs_render = true;
+                        needs_full_render = true;
+                    }
+                    ConsoleEvent::Key(k) => match k {
+                        KeyType::Quit => return,
+                        key => {
+                            if handle_key(
+                                key,
+                                &mut is_search,
+                                &mut filter,
+                                &mut selection,
+                                &mut sort,
+                                &mut needs_sample,
+                                &mut needs_render,
+                                &mut needs_full_render,
+                                &mut last_scroll,
+                            ) {
+                                return;
+                            }
+                            if let Some(p) = sampler.procs.get(selection) {
+                                selected_pid = Some(p.pid);
+                            }
+                        }
+                    },
+                }
+            }
+        }
+
+        let sample_due = now.duration_since(last_sample) >= SAMPLE_INTERVAL || needs_sample;
+        let scroll_quiet = now.duration_since(last_scroll) >= SCROLL_SAMPLE_DELAY;
+        if sample_due && (needs_sample || scroll_quiet) {
             sample(&mut sampler, sort, &filter, &mut cpu, &mut mem, &mut net, &mut gpu, &mut storage, &mut cpus, &mut cached_gpu, &mut last_gpu_read);
             cpu_temp = read_cpu_temp(&mut sampler.cpu_temp_path);
             cpu_freq = read_cpu_freq(&mut sampler.cpu_freq_paths);
-            last_sample = now;
+            sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
+            last_sample = Instant::now();
             needs_sample = false;
             needs_render = true;
+            needs_full_render = true;
         }
 
-        if needs_render && now.duration_since(last_render) >= Duration::from_millis(16) {
+        if needs_render
+            && !needs_full_render
+            && now.duration_since(last_render) >= Duration::from_millis(16)
+            && let Some(layout) = process_layout.as_ref()
+        {
+            let count = sampler.procs.len();
+            sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
+            let visible = layout.visible_rows;
+            let mut scroll_top = selection.saturating_sub(visible / 2);
+            if scroll_top > count.saturating_sub(visible) {
+                scroll_top = count.saturating_sub(visible);
+            }
+
+            if scroll_top == last_painted_scroll_top && last_painted_selection != selection {
+                if let Some(old_row) = process_row_y(layout, scroll_top, last_painted_selection)
+                    && let Some(p) = sampler.procs.get(last_painted_selection)
+                {
+                    paint_process_row(
+                        &mut out,
+                        old_row,
+                        layout.term_width,
+                        layout,
+                        p,
+                        false,
+                        mem.total_bytes,
+                        colours,
+                    );
+                }
+                if let Some(new_row) = process_row_y(layout, scroll_top, selection)
+                    && let Some(p) = sampler.procs.get(selection)
+                {
+                    paint_process_row(
+                        &mut out,
+                        new_row,
+                        layout.term_width,
+                        layout,
+                        p,
+                        true,
+                        mem.total_bytes,
+                        colours,
+                    );
+                }
+                let _ = out.flush();
+                last_painted_selection = selection;
+                last_render = Instant::now();
+                needs_render = false;
+            } else if scroll_top != last_painted_scroll_top {
+                for i in scroll_top..count.min(scroll_top + visible) {
+                    if let Some(row) = process_row_y(layout, scroll_top, i)
+                        && let Some(p) = sampler.procs.get(i)
+                    {
+                        paint_process_row(
+                            &mut out,
+                            row,
+                            layout.term_width,
+                            layout,
+                            p,
+                            i == selection,
+                            mem.total_bytes,
+                            colours,
+                        );
+                    }
+                }
+                if count > 0 {
+                    let end_idx = count.min(scroll_top + visible);
+                    let _ = draw_line_with_style(
+                        &mut out,
+                        layout.term_height,
+                        layout.term_width,
+                        false,
+                        colour(colours, STYLE_MUTED),
+                        format_args!("Showing {}-{} of {}", scroll_top + 1, end_idx, count),
+                    );
+                }
+                let _ = out.flush();
+                last_painted_scroll_top = scroll_top;
+                last_painted_selection = selection;
+                last_render = Instant::now();
+                needs_render = false;
+            } else {
+                needs_full_render = true;
+            }
+        }
+
+        if needs_render && needs_full_render && now.duration_since(last_render) >= Duration::from_millis(16) {
+            #[cfg(target_os = "windows")]
+            refresh_terminal_size_if_needed(&mut needs_vt_size_query);
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let (term_height, term_width) = {
                 let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
@@ -2015,17 +2578,7 @@ fn main() {
                 (h, w)
             };
             #[cfg(target_os = "windows")]
-            let (term_height, term_width) = {
-                let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
-                let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-                if unsafe { GetConsoleScreenBufferInfo(h, &mut csbi) } != 0 {
-                    let w = (csbi.srWindow.Right - csbi.srWindow.Left + 1) as usize;
-                    let h = (csbi.srWindow.Bottom - csbi.srWindow.Top + 1) as u16;
-                    (h, w)
-                } else {
-                    (24u16, 80usize)
-                }
-            };
+            let (term_height, term_width) = terminal_dimensions();
             let mut row = 1_u16;
 
             let _ = write!(out, "\x1B[H");
@@ -2096,39 +2649,48 @@ fn main() {
             let cpu_hdr = if sort == SortMode::Cpu { "CPU%▼" } else { "CPU%" };
             let mem_hdr = if sort == SortMode::Mem { "MEM▼" } else { "MEM" };
 
-            let sort_extra = (if sort == SortMode::Cpu { 2isize } else { 0 }) + (if sort == SortMode::Mem { 2 } else { 0 });
-            let name_w = (term_width as isize - (pid_w as isize + cpu_w as isize + mem_w as isize + thr_w as isize + 9 + sort_extra)).max(12) as usize;
-
             let w1 = cpu_w + if sort == SortMode::Cpu { 2 } else { 0 };
             let w2 = mem_w + if sort == SortMode::Mem { 2 } else { 0 };
+            let name_w = (term_width as isize - pid_w as isize - w1 as isize - w2 as isize - thr_w as isize - 4)
+                .max(12) as usize;
 
             draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_SECTION), format_args!("{:<pid_w$} {:<name_w$} {:>w1$} {:>w2$} {:>thr_w$}", "PID", "NAME", cpu_hdr, mem_hdr, "THR",
                 pid_w=pid_w, name_w=name_w, w1=w1, w2=w2, thr_w=thr_w));
 
-            let max_dashes = term_width;
-            let req_dashes = pid_w + name_w + cpu_w + mem_w + thr_w + 4;
-            let num_dashes = max_dashes.min(req_dashes);
-            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("{}", "-".repeat(num_dashes)));
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("{}", "-".repeat(term_width)));
 
             let visible = term_height.saturating_sub(row) as usize;
             let count = sampler.procs.len();
-            if selection >= count && count > 0 { selection = count - 1; }
-            if count == 0 { selection = 0; }
-
+            sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
             let mut scroll_top = selection.saturating_sub(visible / 2);
             if scroll_top > count.saturating_sub(visible) { scroll_top = count.saturating_sub(visible); }
 
+            let table_start_row = row;
+            let layout = ProcessTableLayout {
+                table_start_row,
+                visible_rows: visible,
+                term_height,
+                term_width,
+                pid_w,
+                name_w,
+                w1,
+                w2,
+                thr_w,
+            };
+
             for i in scroll_top..count.min(scroll_top + visible) {
                 let p = &sampler.procs[i];
-                let mut p_name = p.name.clone();
-                if p_name.chars().count() > name_w {
-                    p_name = p_name.chars().take(name_w).collect();
-                }
-
-                let row_style = process_row_style(p.cpu_percent, p.mem_bytes, mem.total_bytes, colours);
-                draw_next_line_with_style(&mut out, &mut row, term_height, term_width, i == selection, row_style, format_args!("{:<pid_w$} {:<name_w$} {:>w1$.1} {:>mem_w$} {:>thr_w$}",
-                    p.pid, p_name, p.cpu_percent, human_bytes(p.mem_bytes), p.threads,
-                    pid_w=pid_w, name_w=name_w, w1=w1, mem_w=w2, thr_w=thr_w));
+                paint_process_row(
+                    &mut out,
+                    table_start_row.saturating_add((i - scroll_top) as u16),
+                    term_width,
+                    &layout,
+                    p,
+                    i == selection,
+                    mem.total_bytes,
+                    colours,
+                );
+                row = row.saturating_add(1);
             }
             let clear_row = row.min(term_height);
             let _ = write!(out, "\x1B[{};1H\x1B[J", clear_row);
@@ -2137,93 +2699,24 @@ fn main() {
                 let _ = draw_line_with_style(&mut out, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("Showing {}-{} of {}", scroll_top + 1, end_idx, count));
             }
             let _ = out.flush();
-            last_render = now;
+            process_layout = Some(layout);
+            last_painted_selection = selection;
+            last_painted_scroll_top = scroll_top;
+            last_render = Instant::now();
             needs_render = false;
+            needs_full_render = false;
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let has_input = {
+        {
             let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
-            (unsafe { libc::poll(&mut pfd, 1, 10) }) > 0
-        };
-        #[cfg(target_os = "windows")]
-        let has_input = unsafe { WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE), 10) == 0 };
-
-        if has_input {
-            loop {
-                let k = read_key();
-                match k {
-                    KeyType::None => break,
-                    KeyType::Quit => { return; }
-                    _ => {
-                        if is_search {
-                            match k {
-                                KeyType::Esc => {
-                                    is_search = false;
-                                    filter.clear();
-                                    needs_sample = true;
-                                    needs_render = true;
-                                }
-                                KeyType::Enter => {
-                                    is_search = false;
-                                    needs_render = true;
-                                }
-                                KeyType::Backspace => {
-                                    if !filter.is_empty() {
-                                        filter.pop();
-                                        selection = 0;
-                                        needs_sample = true;
-                                    } else {
-                                        is_search = false;
-                                        needs_render = true;
-                                    }
-                                }
-                                KeyType::Char(c)
-                                    if filter.len() < 63 => {
-                                        filter.push(c);
-                                        selection = 0;
-                                        needs_sample = true;
-                                    }
-                                _ => {}
-                            }
-                        } else {
-                            match k {
-                                KeyType::Up => {
-                                    selection = selection.saturating_sub(1);
-                                    needs_render = true;
-                                }
-                                KeyType::Down => {
-                                    selection += 1;
-                                    needs_render = true;
-                                }
-                                KeyType::Left => {
-                                    sort = SortMode::Cpu;
-                                    needs_sample = true;
-                                }
-                                KeyType::Right => {
-                                    sort = SortMode::Mem;
-                                    needs_sample = true;
-                                }
-                                KeyType::Esc
-                                    if !filter.is_empty() => {
-                                        filter.clear();
-                                        selection = 0;
-                                        needs_sample = true;
-                                    }
-                                KeyType::Char(c) => {
-                                    if c == 'q' { return; }
-                                    if c == 'j' { selection += 1; needs_render = true; }
-                                    if c == 'k' { selection = selection.saturating_sub(1); needs_render = true; }
-                                    if c == 'h' { sort = SortMode::Cpu; needs_sample = true; }
-                                    if c == 'l' { sort = SortMode::Mem; needs_sample = true; }
-                                    if c == '/' { is_search = true; filter.clear(); needs_render = true; }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
+            if unsafe { libc::poll(&mut pfd, 1, 10) } <= 0 {
+                std::thread::sleep(Duration::from_millis(10));
             }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            unsafe { WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE), 10); }
         }
     }
 }
@@ -2257,6 +2750,53 @@ mod tests {
         assert!(rendered.contains(STYLE_OK));
         assert!(rendered.contains("abc"));
         assert!(!rendered.contains("abcd"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_parse_terminal_size_response() {
+        assert_eq!(
+            parse_terminal_size_response("\x1b[8;45;132t"),
+            Some((45, 132))
+        );
+        assert_eq!(parse_terminal_size_response("[8;30;100t"), Some((30, 100)));
+        assert_eq!(parse_terminal_size_response("invalid"), None);
+    }
+
+    #[test]
+    fn test_sync_selection_by_pid_follows_process_after_sort() {
+        let procs = vec![
+            ProcessInfo { pid: 10, name: "a".into(), cpu_percent: 5.0, mem_bytes: 0, threads: 1 },
+            ProcessInfo { pid: 20, name: "b".into(), cpu_percent: 1.0, mem_bytes: 0, threads: 1 },
+        ];
+        let mut selection = 1;
+        let mut selected_pid = Some(20);
+        sync_selection_by_pid(&mut selection, &mut selected_pid, &procs);
+        assert_eq!(selection, 1);
+        assert_eq!(selected_pid, Some(20));
+
+        let reordered = vec![
+            ProcessInfo { pid: 20, name: "b".into(), cpu_percent: 9.0, mem_bytes: 0, threads: 1 },
+            ProcessInfo { pid: 10, name: "a".into(), cpu_percent: 1.0, mem_bytes: 0, threads: 1 },
+        ];
+        sync_selection_by_pid(&mut selection, &mut selected_pid, &reordered);
+        assert_eq!(selection, 0);
+        assert_eq!(selected_pid, Some(20));
+    }
+
+    #[test]
+    fn test_format_to_width_pads_short_lines() {
+        assert_eq!(format_to_width(format_args!("hi"), 5), "hi   ");
+        assert_eq!(format_to_width(format_args!("hello"), 5), "hello");
+        assert_eq!(format_to_width(format_args!("abcdef"), 3), "abc");
+    }
+
+    #[test]
+    fn test_styled_line_pads_to_terminal_width() {
+        let mut out = Vec::new();
+        draw_line_with_style(&mut out, 1, 6, true, STYLE_NONE, format_args!("abc")).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("abc   "));
     }
 
     #[test]
