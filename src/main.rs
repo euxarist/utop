@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use windows_sys::core::BOOL;
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, TRUE, FILETIME, CloseHandle};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Console::{
@@ -1976,6 +1977,7 @@ fn sample(
     });
 }
 
+#[derive(PartialEq)]
 enum KeyType {
     Quit, Up, Down, Left, Right, Backspace, Enter, Esc, Char(char),
 }
