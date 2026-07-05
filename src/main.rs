@@ -2018,9 +2018,7 @@ fn read_csbi_dimensions() -> (u16, usize) {
         }
         let window_w = (csbi.srWindow.Right - csbi.srWindow.Left + 1).max(1) as usize;
         let window_h = (csbi.srWindow.Bottom - csbi.srWindow.Top + 1).max(1) as u16;
-        let buffer_w = csbi.dwSize.X.max(1) as usize;
-        let buffer_h = csbi.dwSize.Y.max(1) as u16;
-        (window_h.max(buffer_h), window_w.max(buffer_w))
+        (window_h, window_w)
     }
 }
 
