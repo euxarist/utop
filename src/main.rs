@@ -59,13 +59,14 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Registry::{
     RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_LOCAL_MACHINE,
-    KEY_READ, REG_SZ,
+    KEY_READ, REG_SZ, REG_DWORD,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::System::Power::{
-    CallNtPowerInformation, ProcessorInformation, PROCESSOR_POWER_INFORMATION,
+use windows_sys::Win32::System::Performance::{
+    PdhOpenQueryW, PdhAddEnglishCounterW, PdhCollectQueryData, PdhGetFormattedCounterValue,
+    PdhCloseQuery, PDH_HQUERY, PDH_HCOUNTER, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
 };
 
 #[derive(Default, Clone)]
@@ -772,27 +773,90 @@ fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
 }
 
 #[cfg(target_os = "windows")]
-fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
+fn win_reg_read_u32(subkey: &[u16], value_name: &[u16]) -> Option<u32> {
     unsafe {
-        let count = active_cpu_count() as usize;
-        if count == 0 { return 0.0; }
-
-        let mut pinfo: Vec<PROCESSOR_POWER_INFORMATION> = vec![std::mem::zeroed(); count];
-        let ret = CallNtPowerInformation(
-            ProcessorInformation, std::ptr::null(), 0,
-            pinfo.as_mut_ptr() as *mut core::ffi::c_void,
-            (count * std::mem::size_of::<PROCESSOR_POWER_INFORMATION>()) as u32,
-        );
-        if ret != 0 { return 0.0; }
-
-        // MhzLimit includes turbo headroom; CurrentMhz is the actual frequency.
-        // Pick the highest across all processors.
-        let mut best = pinfo[0].MaxMhz;
-        for p in &pinfo {
-            if p.CurrentMhz > best { best = p.CurrentMhz; }
-            if p.MhzLimit > best { best = p.MhzLimit; }
+        let mut hkey: windows_sys::Win32::System::Registry::HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return None;
         }
-        best as f64
+        let mut buf: u32 = 0;
+        let mut buf_len = std::mem::size_of::<u32>() as u32;
+        let mut reg_type: u32 = 0;
+        let result = RegQueryValueExW(
+            hkey, value_name.as_ptr(), std::ptr::null(),
+            &mut reg_type, &mut buf as *mut u32 as *mut u8, &mut buf_len,
+        );
+        RegCloseKey(hkey);
+        if result != 0 || reg_type != REG_DWORD { return None; }
+        Some(buf)
+    }
+}
+
+// Task Manager's "Speed" is the base clock (registry ~MHz) scaled by the
+// "% Processor Performance" counter, which can exceed 100% under turbo boost.
+#[cfg(target_os = "windows")]
+enum PdhState {
+    Uninit,
+    Failed,
+    Ready(usize, usize),
+}
+
+#[cfg(target_os = "windows")]
+static PDH_QUERY: std::sync::Mutex<PdhState> = std::sync::Mutex::new(PdhState::Uninit);
+
+#[cfg(target_os = "windows")]
+fn pdh_processor_performance_percent() -> Option<f64> {
+    unsafe {
+        let mut state = PDH_QUERY.lock().ok()?;
+        if matches!(*state, PdhState::Uninit) {
+            let mut hquery: PDH_HQUERY = std::ptr::null_mut();
+            if PdhOpenQueryW(std::ptr::null(), 0, &mut hquery) != 0 {
+                *state = PdhState::Failed;
+            } else {
+                let path = win_wstr("\\Processor Information(_Total)\\% Processor Performance");
+                let mut hcounter: PDH_HCOUNTER = std::ptr::null_mut();
+                if PdhAddEnglishCounterW(hquery, path.as_ptr(), 0, &mut hcounter) != 0 {
+                    PdhCloseQuery(hquery);
+                    *state = PdhState::Failed;
+                } else {
+                    // Prime the counter so the next collect has a delta to compute from.
+                    PdhCollectQueryData(hquery);
+                    *state = PdhState::Ready(hquery as usize, hcounter as usize);
+                }
+            }
+        }
+        let (hquery, hcounter) = match *state {
+            PdhState::Ready(q, c) => (q as PDH_HQUERY, c as PDH_HCOUNTER),
+            _ => return None,
+        };
+        if PdhCollectQueryData(hquery) != 0 {
+            return None;
+        }
+        let mut value: PDH_FMT_COUNTERVALUE = std::mem::zeroed();
+        let mut counter_type: u32 = 0;
+        if PdhGetFormattedCounterValue(hcounter, PDH_FMT_DOUBLE, &mut counter_type, &mut value) != 0 {
+            return None;
+        }
+        Some(value.Anonymous.doubleValue)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_cpu_freq(cached_paths: &mut Vec<String>) -> f64 {
+    if cached_paths.is_empty() {
+        let base_mhz = win_reg_read_u32(
+            &win_wstr("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0"),
+            &win_wstr("~MHz"),
+        ).unwrap_or(0);
+        cached_paths.push(base_mhz.to_string());
+    }
+    let base_mhz: f64 = cached_paths[0].parse().unwrap_or(0.0);
+    if base_mhz <= 0.0 {
+        return 0.0;
+    }
+    match pdh_processor_performance_percent() {
+        Some(pct) if pct > 0.0 => base_mhz * pct / 100.0,
+        _ => base_mhz,
     }
 }
 
