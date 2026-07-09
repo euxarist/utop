@@ -67,6 +67,12 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use windows_sys::Win32::System::Power::{
     CallNtPowerInformation, ProcessorInformation, PROCESSOR_POWER_INFORMATION,
 };
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Performance::{
+    PdhOpenQueryW, PdhAddEnglishCounterW, PdhCollectQueryData,
+    PdhGetFormattedCounterValue, PdhCloseQuery, PdhEnumObjectItemsW,
+    PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
+};
 
 #[derive(Default, Clone)]
 struct CpuTimes {
@@ -278,11 +284,14 @@ struct Sampler {
     gpu_cores: String,
     procs: Vec<ProcessInfo>,
     cpu_temp_path: Option<String>,
+    #[cfg(not(target_os = "windows"))]
     cpu_freq_paths: Vec<String>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     logical_cpus: u64,
     #[cfg(target_os = "macos")]
     proc_names: HashMap<i32, String>,
+    #[cfg(target_os = "windows")]
+    pdh_freq: Option<PdhFreqQuery>,
 }
 
 impl Sampler {
@@ -301,6 +310,7 @@ impl Sampler {
             gpu_cores: read_gpu_cores(),
             procs: Vec::new(),
             cpu_temp_path: None,
+            #[cfg(not(target_os = "windows"))]
             cpu_freq_paths: Vec::new(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             logical_cpus: {
@@ -311,6 +321,8 @@ impl Sampler {
             },
             #[cfg(target_os = "macos")]
             proc_names: HashMap::new(),
+            #[cfg(target_os = "windows")]
+            pdh_freq: None,
         }
     }
 }
@@ -772,7 +784,78 @@ fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
 }
 
 #[cfg(target_os = "windows")]
-fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
+struct PdhFreqQuery {
+    query: *mut core::ffi::c_void,
+    counters: Vec<*mut core::ffi::c_void>,
+}
+
+// Task Manager's CPU speed is the simple average of each logical processor's
+// "% Processor Performance" counter (times the base clock), not the PDH
+// "_Total" instance's own aggregate, which is weighted differently and reads
+// noticeably higher on hybrid P-core/E-core CPUs. Enumerate the per-core
+// instance names (they're "<NUMA node>,<core index>", not just an index) so
+// this works regardless of NUMA topology.
+#[cfg(target_os = "windows")]
+fn open_pdh_freq_query() -> Option<PdhFreqQuery> {
+    unsafe {
+        let object = win_wstr("Processor Information");
+        let mut counter_len: u32 = 0;
+        let mut instance_len: u32 = 0;
+        PdhEnumObjectItemsW(
+            std::ptr::null(), std::ptr::null(), object.as_ptr(),
+            std::ptr::null_mut(), &mut counter_len,
+            std::ptr::null_mut(), &mut instance_len,
+            0, 0,
+        );
+        if instance_len == 0 { return None; }
+        let mut counter_buf: Vec<u16> = vec![0; counter_len as usize];
+        let mut instance_buf: Vec<u16> = vec![0; instance_len as usize];
+        if PdhEnumObjectItemsW(
+            std::ptr::null(), std::ptr::null(), object.as_ptr(),
+            counter_buf.as_mut_ptr(), &mut counter_len,
+            instance_buf.as_mut_ptr(), &mut instance_len,
+            0, 0,
+        ) != 0 {
+            return None;
+        }
+
+        let mut instances = Vec::new();
+        let mut start = 0;
+        for i in 0..instance_buf.len() {
+            if instance_buf[i] == 0 {
+                if i > start {
+                    let name = String::from_utf16_lossy(&instance_buf[start..i]);
+                    if !name.contains("_Total") {
+                        instances.push(name);
+                    }
+                }
+                start = i + 1;
+            }
+        }
+        if instances.is_empty() { return None; }
+
+        let mut query: *mut core::ffi::c_void = std::ptr::null_mut();
+        if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != 0 { return None; }
+
+        let mut counters = Vec::with_capacity(instances.len());
+        for inst in &instances {
+            let path = win_wstr(&format!("\\Processor Information({inst})\\% Processor Performance"));
+            let mut counter: *mut core::ffi::c_void = std::ptr::null_mut();
+            if PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) == 0 {
+                counters.push(counter);
+            }
+        }
+        if counters.is_empty() {
+            PdhCloseQuery(query);
+            return None;
+        }
+        PdhCollectQueryData(query); // prime the counters
+        Some(PdhFreqQuery { query, counters })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_cpu_freq(pdh_freq: &mut Option<PdhFreqQuery>) -> f64 {
     unsafe {
         let count = active_cpu_count() as usize;
         if count == 0 { return 0.0; }
@@ -784,15 +867,30 @@ fn read_cpu_freq(_cached_paths: &mut Vec<String>) -> f64 {
             (count * std::mem::size_of::<PROCESSOR_POWER_INFORMATION>()) as u32,
         );
         if ret != 0 { return 0.0; }
+        let base_mhz = pinfo[0].MaxMhz as f64;
+        if base_mhz <= 0.0 { return 0.0; }
 
-        // MhzLimit includes turbo headroom; CurrentMhz is the actual frequency.
-        // Pick the highest across all processors.
-        let mut best = pinfo[0].MaxMhz;
-        for p in &pinfo {
-            if p.CurrentMhz > best { best = p.CurrentMhz; }
-            if p.MhzLimit > best { best = p.MhzLimit; }
+        if pdh_freq.is_none() {
+            *pdh_freq = open_pdh_freq_query();
+            return base_mhz;
         }
-        best as f64
+        let pf = pdh_freq.as_ref().unwrap();
+        if PdhCollectQueryData(pf.query) != 0 { return base_mhz; }
+
+        let mut sum = 0.0;
+        let mut n = 0u32;
+        for &counter in &pf.counters {
+            let mut value: PDH_FMT_COUNTERVALUE = std::mem::zeroed();
+            let mut counter_type: u32 = 0;
+            if PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, &mut counter_type, &mut value) == 0
+                && value.CStatus == 0
+            {
+                sum += value.Anonymous.doubleValue;
+                n += 1;
+            }
+        }
+        if n == 0 { return base_mhz; }
+        base_mhz * (sum / n as f64) / 100.0
     }
 }
 
@@ -2474,7 +2572,10 @@ fn main() {
         if sample_due && (needs_sample || scroll_quiet) {
             sample(&mut sampler, sort, &filter, &mut cpu, &mut mem, &mut net, &mut gpu, &mut storage, &mut cpus, &mut cached_gpu, &mut last_gpu_read);
             cpu_temp = read_cpu_temp(&mut sampler.cpu_temp_path);
-            cpu_freq = read_cpu_freq(&mut sampler.cpu_freq_paths);
+            #[cfg(target_os = "windows")]
+            { cpu_freq = read_cpu_freq(&mut sampler.pdh_freq); }
+            #[cfg(not(target_os = "windows"))]
+            { cpu_freq = read_cpu_freq(&mut sampler.cpu_freq_paths); }
             sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
             last_sample = Instant::now();
             needs_sample = false;
@@ -2935,7 +3036,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn test_read_cpu_freq_windows() {
-        let freq = read_cpu_freq(&mut Vec::new());
+        let mut pdh_freq = None;
+        // First call just primes the PDH query and returns the base clock.
+        read_cpu_freq(&mut pdh_freq);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let freq = read_cpu_freq(&mut pdh_freq);
         eprintln!("debug: read_cpu_freq returned {freq} MHz");
         assert!(freq > 0.0, "CPU frequency should be > 0, got {freq}");
         assert!(freq < 100_000.0, "CPU frequency unrealistic, got {freq}");
