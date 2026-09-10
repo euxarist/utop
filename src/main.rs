@@ -133,6 +133,8 @@ struct StorageSnapshot {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Terminal {
     original_termios: libc::termios,
+    original_stdin_flags: libc::c_int,
+    original_stdout_flags: libc::c_int,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -144,17 +146,29 @@ impl Terminal {
                 return Err(io::Error::last_os_error());
             }
 
+            let original_stdin_flags = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL);
+            let original_stdout_flags = libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL);
+            if original_stdin_flags < 0 || original_stdout_flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let terminal = Self { original_termios, original_stdin_flags, original_stdout_flags };
             let mut raw = original_termios;
             raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw);
+            raw.c_cc[libc::VMIN] = 0;
+            raw.c_cc[libc::VTIME] = 0;
+            // stdin and stdout can share an open file description. O_NONBLOCK
+            // on stdin would also make frame writes partial/fail with EAGAIN.
+            // Termios makes reads nonblocking without changing output semantics.
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) != 0
+                || libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, original_stdin_flags & !libc::O_NONBLOCK) < 0
+                || libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, original_stdout_flags & !libc::O_NONBLOCK) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
 
-            let flags = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL);
-            libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
-
-            print!("\x1B[?1049h\x1B[?7l\x1B[2J\x1B[H\x1B[?25l");
+            io::stdout().write_all(b"\x1B[?1049h\x1B[?7l\x1B[2J\x1B[H\x1B[?25l")?;
             io::stdout().flush()?;
-
-            Ok(Self { original_termios })
+            Ok(terminal)
         }
     }
 }
@@ -162,11 +176,13 @@ impl Terminal {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for Terminal {
     fn drop(&mut self) {
+        let _ = io::stdout().write_all(b"\x1B[?7h\x1B[?1049l\x1B[?25h\x1B[0m");
+        let _ = io::stdout().flush();
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.original_termios);
+            libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, self.original_stdin_flags);
+            libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, self.original_stdout_flags);
         }
-        print!("\x1B[?7h\x1B[?1049l\x1B[?25h\x1B[0m");
-        let _ = io::stdout().flush();
     }
 }
 
@@ -1966,7 +1982,11 @@ fn sample(
     s.prev_ticks = new_ticks;
     s.prev_cpu = cur_cpu;
 
-    s.procs.sort_by(|a, b| {
+    sort_processes(&mut s.procs, sort);
+}
+
+fn sort_processes(procs: &mut [ProcessInfo], sort: SortMode) {
+    procs.sort_by(|a, b| {
         if sort == SortMode::Cpu {
             b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(Ordering::Equal)
                 .then_with(|| b.mem_bytes.cmp(&a.mem_bytes))
@@ -2304,7 +2324,6 @@ fn handle_key(
     filter: &mut String,
     selection: &mut usize,
     sort: &mut SortMode,
-    needs_sample: &mut bool,
     needs_render: &mut bool,
     needs_full_render: &mut bool,
     last_scroll: &mut Instant,
@@ -2358,12 +2377,12 @@ fn handle_key(
         }
         KeyType::Left => {
             *sort = SortMode::Cpu;
-            *needs_sample = true;
+            *needs_render = true;
             *needs_full_render = true;
         }
         KeyType::Right => {
             *sort = SortMode::Mem;
-            *needs_sample = true;
+            *needs_render = true;
             *needs_full_render = true;
         }
         KeyType::Esc if !filter.is_empty() => {
@@ -2388,12 +2407,12 @@ fn handle_key(
             }
             if c == 'h' {
                 *sort = SortMode::Cpu;
-                *needs_sample = true;
+                *needs_render = true;
                 *needs_full_render = true;
             }
             if c == 'l' {
                 *sort = SortMode::Mem;
-                *needs_sample = true;
+                *needs_render = true;
                 *needs_full_render = true;
             }
             if c == '/' {
@@ -2408,6 +2427,81 @@ fn handle_key(
     false
 }
 
+#[derive(Default)]
+struct SystemSnapshot {
+    cpu: f64,
+    mem: MemorySnapshot,
+    net: NetworkSnapshot,
+    gpu: GpuSnapshot,
+    storage: Vec<StorageSnapshot>,
+    cpus: String,
+    cpu_name: String,
+    gpu_cores: String,
+    cpu_temp: Option<f64>,
+    cpu_freq: f64,
+    procs: Vec<ProcessInfo>,
+}
+
+struct SamplingWorker {
+    latest: std::sync::Arc<std::sync::Mutex<Option<SystemSnapshot>>>,
+    stop: std::sync::mpsc::Sender<()>,
+}
+
+impl SamplingWorker {
+    fn start(mut collect: impl FnMut() -> SystemSnapshot + Send + 'static) -> Self {
+        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let pending = std::sync::Arc::clone(&latest);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || loop {
+            // Discovery, subprocesses, and all system calls run outside the UI
+            // thread and the exchange lock. Only one completed snapshot is kept.
+            let snapshot = collect();
+            let previous = match pending.lock() {
+                Ok(mut slot) => slot.replace(snapshot),
+                Err(_) => return,
+            };
+            drop(previous);
+            if stopped.recv_timeout(Duration::from_millis(500))
+                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                return;
+            }
+        });
+        Self { latest, stop }
+    }
+
+    fn take(&self) -> Option<SystemSnapshot> {
+        self.latest.try_lock().ok()?.take()
+    }
+}
+
+impl Drop for SamplingWorker {
+    fn drop(&mut self) {
+        // Never wait for an unresponsive collector on quit.
+        let _ = self.stop.send(());
+    }
+}
+
+fn start_sampling() -> SamplingWorker {
+    let mut sampler = None;
+    let mut cached_gpu = GpuSnapshot::default();
+    let mut last_gpu_read = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+    SamplingWorker::start(move || {
+        let sampler = sampler.get_or_insert_with(Sampler::new);
+        let mut snapshot = SystemSnapshot::default();
+        sample(sampler, SortMode::Cpu, "", &mut snapshot.cpu, &mut snapshot.mem,
+            &mut snapshot.net, &mut snapshot.gpu, &mut snapshot.storage,
+            &mut snapshot.cpus, &mut cached_gpu, &mut last_gpu_read);
+        let temp = read_cpu_temp(&mut sampler.cpu_temp_path);
+        snapshot.cpu_temp = (temp > -1000.0).then_some(temp);
+        snapshot.cpu_freq = read_cpu_freq(&mut sampler.cpu_freq_paths);
+        snapshot.cpu_name = sampler.cpu_name.clone();
+        snapshot.gpu_cores = sampler.gpu_cores.clone();
+        snapshot.procs = std::mem::take(&mut sampler.procs);
+        snapshot
+    })
+}
+
 fn main() {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     unsafe {
@@ -2419,9 +2513,20 @@ fn main() {
         SetConsoleCtrlHandler(Some(ctrl_handler), TRUE);
     }
 
-    let _terminal = Terminal::init().ok();
+    let _terminal = match Terminal::init() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            eprintln!("utop: cannot initialize terminal: {error}");
+            std::process::exit(1);
+        }
+    };
     
-    let mut sampler = Sampler::new();
+    let worker = start_sampling();
+    let mut snapshot = SystemSnapshot {
+        cpu_name: "CPU".into(),
+        cpus: "Sampling...".into(),
+        ..SystemSnapshot::default()
+    };
     let mut sort = SortMode::Cpu;
     let mut filter = String::new();
     let mut is_search = false;
@@ -2432,20 +2537,10 @@ fn main() {
     let mut selected_pid: Option<i32> = None;
     let colours = colour_enabled();
 
-    let mut last_sample = Instant::now();
-    let mut last_render = Instant::now();
+    let mut last_render = Instant::now().checked_sub(Duration::from_millis(16)).unwrap();
     let mut last_scroll = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
     let mut out = BufWriter::with_capacity(16384, io::stdout());
-    let mut cpu = 0.0;
-    let mut mem = MemorySnapshot::default();
-    let mut net = NetworkSnapshot::default();
-    let mut gpu = GpuSnapshot::default();
-    let mut storage: Vec<StorageSnapshot> = Vec::new();
-    let mut cached_gpu = GpuSnapshot::default();
-    let mut last_gpu_read = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
-    let mut cpus = String::new();
-    let mut needs_sample = true;
     let mut needs_render = true;
     let mut needs_full_render = true;
     let mut process_layout: Option<ProcessTableLayout> = None;
@@ -2454,16 +2549,11 @@ fn main() {
     #[cfg(target_os = "windows")]
     let mut needs_vt_size_query = true;
 
-    let mut cpu_temp = -1000.0;
-    let mut cpu_freq = 0.0;
-
-    const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
-    const SCROLL_SAMPLE_DELAY: Duration = Duration::from_millis(250);
-
     loop {
         if QUIT.load(AtomicOrdering::SeqCst) { break; }
         let now = Instant::now();
         let previous_filter = filter.clone();
+        let previous_sort = sort;
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -2481,7 +2571,6 @@ fn main() {
                     &mut filter,
                     &mut selection,
                     &mut sort,
-                    &mut needs_sample,
                     &mut needs_render,
                     &mut needs_full_render,
                     &mut last_scroll,
@@ -2512,7 +2601,6 @@ fn main() {
                                 &mut filter,
                                 &mut selection,
                                 &mut sort,
-                                &mut needs_sample,
                                 &mut needs_render,
                                 &mut needs_full_render,
                                 &mut last_scroll,
@@ -2528,25 +2616,31 @@ fn main() {
             }
         }
 
-        if filter != previous_filter {
-            visible_procs = filtered_processes(&sampler.procs, &filter);
-            selection = 0;
-            selected_pid = visible_procs.first().map(|p| p.pid);
+        let filter_changed = filter != previous_filter;
+        let mut view_changed = filter_changed || sort != previous_sort;
+        // Defer replacing rows briefly while navigating, but never stop input or
+        // wait for the sampling thread. The mailbox coalesces pending updates.
+        if now.duration_since(last_scroll) >= Duration::from_millis(250)
+            && let Some(next) = worker.take()
+        {
+            snapshot = next;
+            view_changed = true;
         }
-
-        let sample_due = now.duration_since(last_sample) >= SAMPLE_INTERVAL || needs_sample;
-        let scroll_quiet = now.duration_since(last_scroll) >= SCROLL_SAMPLE_DELAY;
-        if sample_due && (needs_sample || scroll_quiet) {
-            sample(&mut sampler, sort, "", &mut cpu, &mut mem, &mut net, &mut gpu, &mut storage, &mut cpus, &mut cached_gpu, &mut last_gpu_read);
-            cpu_temp = read_cpu_temp(&mut sampler.cpu_temp_path);
-            cpu_freq = read_cpu_freq(&mut sampler.cpu_freq_paths);
-            visible_procs = filtered_processes(&sampler.procs, &filter);
+        if view_changed {
+            visible_procs = filtered_processes(&snapshot.procs, &filter);
+            sort_processes(&mut visible_procs, sort);
+            if filter_changed {
+                selection = 0;
+                selected_pid = None;
+            }
             sync_selection_by_pid(&mut selection, &mut selected_pid, &visible_procs);
-            last_sample = Instant::now();
-            needs_sample = false;
             needs_render = true;
             needs_full_render = true;
         }
+        let SystemSnapshot { cpu, mem, net, gpu, storage, cpus, cpu_freq, .. } = &snapshot;
+        let cpu = *cpu;
+        let cpu_freq = *cpu_freq;
+        let cpu_temp = snapshot.cpu_temp.unwrap_or(-1000.0);
 
         if needs_render
             && !needs_full_render
@@ -2590,7 +2684,7 @@ fn main() {
                         colours,
                     );
                 }
-                let _ = out.flush();
+                if out.flush().is_err() { return; }
                 last_painted_selection = selection;
                 last_render = Instant::now();
                 needs_render = false;
@@ -2622,7 +2716,7 @@ fn main() {
                         format_args!("Showing {}-{} of {}", scroll_top + 1, end_idx, count),
                     );
                 }
-                let _ = out.flush();
+                if out.flush().is_err() { return; }
                 last_painted_scroll_top = scroll_top;
                 last_painted_selection = selection;
                 last_render = Instant::now();
@@ -2648,13 +2742,13 @@ fn main() {
             let mut row = 1_u16;
 
             let _ = write!(out, "\x1B[H");
-            let gpu_cores_str = if !sampler.gpu_cores.is_empty() { format!("    {}", sampler.gpu_cores) } else { String::new() };
+            let gpu_cores_str = if !snapshot.gpu_cores.is_empty() { format!("    {}", snapshot.gpu_cores) } else { String::new() };
             draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_TITLE), format_args!("utop (Rust version)    {}{}", cpus, gpu_cores_str));
 
             let temp_str = if cpu_temp > -1000.0 { format!(" {:.1}°C", cpu_temp) } else { String::new() };
             let freq_str = if cpu_freq > 0.0 { format!(" @ {:.2} GHz", cpu_freq / 1000.0) } else { String::new() };
 
-            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, usage_style(cpu, colours), format_args!("{}: {:5.1}%{}{}", sampler.cpu_name, cpu, freq_str, temp_str));
+            draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, usage_style(cpu, colours), format_args!("{}: {:5.1}%{}{}", snapshot.cpu_name, cpu, freq_str, temp_str));
             let mem_pct = if mem.total_bytes > 0 { mem.used_bytes as f64 * 100.0 / mem.total_bytes as f64 } else { 0.0 };
             draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, usage_style(mem_pct, colours), format_args!("MEM: {:5.1}% {} / {}", mem_pct, human_bytes(mem.used_bytes), human_bytes(mem.total_bytes)));
 
@@ -2764,7 +2858,7 @@ fn main() {
                 let end_idx = count.min(scroll_top + visible);
                 let _ = draw_line_with_style(&mut out, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("Showing {}-{} of {}", scroll_top + 1, end_idx, count));
             }
-            let _ = out.flush();
+            if out.flush().is_err() { return; }
             process_layout = Some(layout);
             last_painted_selection = selection;
             last_painted_scroll_top = scroll_top;
@@ -2776,9 +2870,7 @@ fn main() {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
-            if unsafe { libc::poll(&mut pfd, 1, 10) } <= 0 {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            unsafe { libc::poll(&mut pfd, 1, 8); }
         }
         #[cfg(target_os = "windows")]
         {
@@ -2790,6 +2882,66 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_slow_collector_does_not_block_ui_or_quit() {
+        let (started, collecting) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, completed) = std::sync::mpsc::channel();
+        let worker = SamplingWorker::start(move || {
+            started.send(()).unwrap();
+            let _ = blocked.recv();
+            let _ = finished.send(());
+            SystemSnapshot::default()
+        });
+        collecting.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The collector is deliberately stuck. Polling and shutdown must not
+        // need its lock or join its thread.
+        assert!(worker.take().is_none());
+        let start = Instant::now();
+        drop(worker);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        release.send(()).unwrap();
+        completed.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn test_sampling_keeps_only_latest_unread_snapshot() {
+        let (published, sampled) = std::sync::mpsc::channel();
+        let mut generation = 0;
+        let worker = SamplingWorker::start(move || {
+            generation += 1;
+            published.send(generation).unwrap();
+            SystemSnapshot { cpu: generation as f64, ..SystemSnapshot::default() }
+        });
+        assert_eq!(sampled.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        assert_eq!(sampled.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        // Notification happens inside the collector, just before publication.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let ready = worker.latest.lock().unwrap().as_ref()
+                .is_some_and(|snapshot| snapshot.cpu >= 2.0);
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(worker.take().unwrap().cpu >= 2.0);
+        assert!(worker.take().is_none());
+    }
+
+    #[test]
+    fn test_cached_sort_does_not_need_new_system_data() {
+        let mut procs = vec![
+            ProcessInfo { pid: 10, name: "a".into(), cpu_percent: 5.0, mem_bytes: 10, threads: 1 },
+            ProcessInfo { pid: 20, name: "b".into(), cpu_percent: 1.0, mem_bytes: 20, threads: 1 },
+        ];
+        sort_processes(&mut procs, SortMode::Mem);
+        assert_eq!(procs[0].pid, 20);
+        sort_processes(&mut procs, SortMode::Cpu);
+        assert_eq!(procs[0].pid, 10);
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
@@ -2826,19 +2978,17 @@ mod tests {
     }
 
     #[test]
-    fn test_search_edits_do_not_request_sampling() {
+    fn test_search_edits_request_immediate_redraw() {
         let mut searching = true;
         let mut filter = String::new();
         let mut selection = 0;
         let mut sort = SortMode::Cpu;
-        let mut sample = false;
         let mut render = false;
         let mut full = false;
         let mut scroll = Instant::now();
         for key in [KeyType::Char('a'), KeyType::Backspace, KeyType::Esc] {
             handle_key(key, &mut searching, &mut filter, &mut selection,
-                &mut sort, &mut sample, &mut render, &mut full, &mut scroll);
-            assert!(!sample, "search must use cached processes");
+                &mut sort, &mut render, &mut full, &mut scroll);
             assert!(render && full);
             render = false;
             full = false;

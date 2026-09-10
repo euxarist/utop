@@ -47,6 +47,10 @@ jobs:
     - name: Run tests
       run: cargo test
 
+    - name: Check terminal responsiveness (Unix)
+      if: runner.os != 'Windows'
+      run: python3 scripts/tui_latency.py target/release/utop
+
     - name: Check binary exists (Unix)
       if: runner.os != 'Windows'
       run: |
