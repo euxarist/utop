@@ -2219,27 +2219,82 @@ fn parse_key_event(ke: KEY_EVENT_RECORD) -> Option<KeyType> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_key() -> Option<KeyType> {
-    let mut buf = [0u8; 16];
-    let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n <= 0 { return None; }
-    let n = n as usize;
-
-    if buf[0] == 3 { return Some(KeyType::Quit); }
-
-    if n == 1 {
-        if buf[0] == 27 { return Some(KeyType::Esc); }
-        if buf[0] == 127 || buf[0] == 8 { return Some(KeyType::Backspace); }
-        if buf[0] == 10 || buf[0] == 13 { return Some(KeyType::Enter); }
-        if buf[0].is_ascii_graphic() || buf[0] == b' ' { return Some(KeyType::Char(buf[0] as char)); }
-    } else if n >= 3 && buf[0] == 27 && buf[1] == b'[' {
-        if buf[2] == b'A' { return Some(KeyType::Up); }
-        if buf[2] == b'B' { return Some(KeyType::Down); }
-        if buf[2] == b'C' { return Some(KeyType::Right); }
-        if buf[2] == b'D' { return Some(KeyType::Left); }
-    }
-    None
+#[derive(Default)]
+struct KeyReader {
+    pending: std::collections::VecDeque<u8>,
+    escape_since: Option<Instant>,
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl KeyReader {
+    fn read(&mut self) {
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len())
+        };
+        if n > 0 {
+            self.pending.extend(&buf[..n as usize]);
+        }
+    }
+
+    fn next(&mut self, now: Instant) -> Option<KeyType> {
+        loop {
+            let first = *self.pending.front()?;
+            let mut consumed = 1;
+            if first == 27 {
+                let since = *self.escape_since.get_or_insert(now);
+                let prefix = self.pending.get(1).copied();
+                let sequence = matches!(prefix, Some(b'[' | b'O'));
+                if (prefix.is_none() || (sequence && self.pending.len() < 3))
+                    && now.duration_since(since) < Duration::from_millis(30)
+                {
+                    return None;
+                }
+                if sequence && self.pending.len() >= 3 {
+                    consumed = 3;
+                }
+            }
+            let mut bytes = [0u8; 3];
+            for byte in &mut bytes[..consumed] {
+                *byte = self.pending.pop_front().unwrap();
+            }
+            self.escape_since = None;
+            if let Some(key) = decode_key(&bytes[..consumed]) {
+                return Some(key);
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn decode_key(buf: &[u8]) -> Option<KeyType> {
+    let first = *buf.first()?;
+    if first == 27 && buf.len() >= 3 && matches!(buf[1], b'[' | b'O') {
+        return match buf[2] {
+            b'A' => Some(KeyType::Up),
+            b'B' => Some(KeyType::Down),
+            b'C' => Some(KeyType::Right),
+            b'D' => Some(KeyType::Left),
+            _ => None,
+        };
+    }
+    match first {
+        3 => Some(KeyType::Quit),
+        27 => Some(KeyType::Esc),
+        8 | 127 => Some(KeyType::Backspace),
+        10 | 13 => Some(KeyType::Enter),
+        c if c.is_ascii_graphic() || c == b' ' => Some(KeyType::Char(c as char)),
+        _ => None,
+    }
+}
+
+fn filtered_processes(procs: &[ProcessInfo], filter: &str) -> Vec<ProcessInfo> {
+    let needle = filter.to_lowercase();
+    procs.iter().filter(|p| needle.is_empty()
+        || p.name.to_lowercase().contains(&needle)
+        || p.pid.to_string().contains(&needle)).cloned().collect()
+}
+
 
 
 
@@ -2259,7 +2314,6 @@ fn handle_key(
             KeyType::Esc => {
                 *is_search = false;
                 filter.clear();
-                *needs_sample = true;
                 *needs_render = true;
                 *needs_full_render = true;
             }
@@ -2272,7 +2326,7 @@ fn handle_key(
                 if !filter.is_empty() {
                     filter.pop();
                     *selection = 0;
-                    *needs_sample = true;
+                    *needs_render = true;
                     *needs_full_render = true;
                 } else {
                     *is_search = false;
@@ -2283,7 +2337,7 @@ fn handle_key(
             KeyType::Char(c) if filter.len() < 63 => {
                 filter.push(c);
                 *selection = 0;
-                *needs_sample = true;
+                *needs_render = true;
                 *needs_full_render = true;
             }
             _ => {}
@@ -2315,7 +2369,7 @@ fn handle_key(
         KeyType::Esc if !filter.is_empty() => {
             filter.clear();
             *selection = 0;
-            *needs_sample = true;
+            *needs_render = true;
             *needs_full_render = true;
         }
         KeyType::Char(c) => {
@@ -2371,6 +2425,9 @@ fn main() {
     let mut sort = SortMode::Cpu;
     let mut filter = String::new();
     let mut is_search = false;
+    let mut visible_procs: Vec<ProcessInfo> = Vec::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut key_reader = KeyReader::default();
     let mut selection = 0_usize;
     let mut selected_pid: Option<i32> = None;
     let colours = colour_enabled();
@@ -2406,31 +2463,33 @@ fn main() {
     loop {
         if QUIT.load(AtomicOrdering::SeqCst) { break; }
         let now = Instant::now();
+        let previous_filter = filter.clone();
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
             if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
-                while let Some(k) = read_key() {
-                    if k == KeyType::Quit {
-                        return;
-                    }
-                    if handle_key(
-                        k,
-                        &mut is_search,
-                        &mut filter,
-                        &mut selection,
-                        &mut sort,
-                        &mut needs_sample,
-                        &mut needs_render,
-                        &mut needs_full_render,
-                        &mut last_scroll,
-                    ) {
-                        return;
-                    }
-                    if let Some(p) = sampler.procs.get(selection) {
-                        selected_pid = Some(p.pid);
-                    }
+                key_reader.read();
+            }
+            while let Some(k) = key_reader.next(now) {
+                if k == KeyType::Quit {
+                    return;
+                }
+                if handle_key(
+                    k,
+                    &mut is_search,
+                    &mut filter,
+                    &mut selection,
+                    &mut sort,
+                    &mut needs_sample,
+                    &mut needs_render,
+                    &mut needs_full_render,
+                    &mut last_scroll,
+                ) {
+                    return;
+                }
+                if let Some(p) = visible_procs.get(selection) {
+                    selected_pid = Some(p.pid);
                 }
             }
         }
@@ -2460,7 +2519,7 @@ fn main() {
                             ) {
                                 return;
                             }
-                            if let Some(p) = sampler.procs.get(selection) {
+                            if let Some(p) = visible_procs.get(selection) {
                                 selected_pid = Some(p.pid);
                             }
                         }
@@ -2469,13 +2528,20 @@ fn main() {
             }
         }
 
+        if filter != previous_filter {
+            visible_procs = filtered_processes(&sampler.procs, &filter);
+            selection = 0;
+            selected_pid = visible_procs.first().map(|p| p.pid);
+        }
+
         let sample_due = now.duration_since(last_sample) >= SAMPLE_INTERVAL || needs_sample;
         let scroll_quiet = now.duration_since(last_scroll) >= SCROLL_SAMPLE_DELAY;
         if sample_due && (needs_sample || scroll_quiet) {
-            sample(&mut sampler, sort, &filter, &mut cpu, &mut mem, &mut net, &mut gpu, &mut storage, &mut cpus, &mut cached_gpu, &mut last_gpu_read);
+            sample(&mut sampler, sort, "", &mut cpu, &mut mem, &mut net, &mut gpu, &mut storage, &mut cpus, &mut cached_gpu, &mut last_gpu_read);
             cpu_temp = read_cpu_temp(&mut sampler.cpu_temp_path);
             cpu_freq = read_cpu_freq(&mut sampler.cpu_freq_paths);
-            sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
+            visible_procs = filtered_processes(&sampler.procs, &filter);
+            sync_selection_by_pid(&mut selection, &mut selected_pid, &visible_procs);
             last_sample = Instant::now();
             needs_sample = false;
             needs_render = true;
@@ -2487,8 +2553,8 @@ fn main() {
             && now.duration_since(last_render) >= Duration::from_millis(16)
             && let Some(layout) = process_layout.as_ref()
         {
-            let count = sampler.procs.len();
-            sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
+            let count = visible_procs.len();
+            sync_selection_by_pid(&mut selection, &mut selected_pid, &visible_procs);
             let visible = layout.visible_rows;
             let mut scroll_top = selection.saturating_sub(visible / 2);
             if scroll_top > count.saturating_sub(visible) {
@@ -2497,7 +2563,7 @@ fn main() {
 
             if scroll_top == last_painted_scroll_top && last_painted_selection != selection {
                 if let Some(old_row) = process_row_y(layout, scroll_top, last_painted_selection)
-                    && let Some(p) = sampler.procs.get(last_painted_selection)
+                    && let Some(p) = visible_procs.get(last_painted_selection)
                 {
                     paint_process_row(
                         &mut out,
@@ -2511,7 +2577,7 @@ fn main() {
                     );
                 }
                 if let Some(new_row) = process_row_y(layout, scroll_top, selection)
-                    && let Some(p) = sampler.procs.get(selection)
+                    && let Some(p) = visible_procs.get(selection)
                 {
                     paint_process_row(
                         &mut out,
@@ -2531,7 +2597,7 @@ fn main() {
             } else if scroll_top != last_painted_scroll_top {
                 for i in scroll_top..count.min(scroll_top + visible) {
                     if let Some(row) = process_row_y(layout, scroll_top, i)
-                        && let Some(p) = sampler.procs.get(i)
+                        && let Some(p) = visible_procs.get(i)
                     {
                         paint_process_row(
                             &mut out,
@@ -2660,8 +2726,8 @@ fn main() {
             draw_next_line_with_style(&mut out, &mut row, term_height, term_width, false, colour(colours, STYLE_MUTED), format_args!("{}", "-".repeat(term_width)));
 
             let visible = term_height.saturating_sub(row) as usize;
-            let count = sampler.procs.len();
-            sync_selection_by_pid(&mut selection, &mut selected_pid, &sampler.procs);
+            let count = visible_procs.len();
+            sync_selection_by_pid(&mut selection, &mut selected_pid, &visible_procs);
             let mut scroll_top = selection.saturating_sub(visible / 2);
             if scroll_top > count.saturating_sub(visible) { scroll_top = count.saturating_sub(visible); }
 
@@ -2679,7 +2745,7 @@ fn main() {
             };
 
             for i in scroll_top..count.min(scroll_top + visible) {
-                let p = &sampler.procs[i];
+                let p = &visible_procs[i];
                 paint_process_row(
                     &mut out,
                     table_start_row.saturating_add((i - scroll_top) as u16),
@@ -2724,6 +2790,65 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_input_queue_preserves_text_and_split_arrows() {
+        let now = Instant::now();
+        let mut reader = KeyReader::default();
+        reader.pending.extend(b"/abc\x7f\r\x1b[");
+        for key in [KeyType::Char('/'), KeyType::Char('a'), KeyType::Char('b'),
+            KeyType::Char('c'), KeyType::Backspace, KeyType::Enter] {
+            assert!(reader.next(now) == Some(key));
+        }
+        assert!(reader.next(now).is_none());
+        reader.pending.extend(b"Aq\x1b");
+        assert!(reader.next(now) == Some(KeyType::Up));
+        assert!(reader.next(now) == Some(KeyType::Char('q')));
+        assert!(reader.next(now).is_none());
+        assert!(reader.next(now + Duration::from_millis(31)) == Some(KeyType::Esc));
+        reader.pending.extend(b"\0z");
+        assert!(reader.next(now) == Some(KeyType::Char('z')));
+        assert!(reader.next(now).is_none());
+    }
+
+    #[test]
+    fn test_cached_filter_can_narrow_and_restore_processes() {
+        let procs = vec![
+            ProcessInfo { pid: 10, name: "Alpha".into(), cpu_percent: 5.0, mem_bytes: 0, threads: 1 },
+            ProcessInfo { pid: 20, name: "beta".into(), cpu_percent: 1.0, mem_bytes: 0, threads: 1 },
+        ];
+        assert_eq!(filtered_processes(&procs, "ALP")[0].pid, 10);
+        assert_eq!(filtered_processes(&procs, "20")[0].pid, 20);
+        assert!(filtered_processes(&procs, "missing").is_empty());
+        assert_eq!(filtered_processes(&procs, "").len(), 2);
+        assert_eq!(procs.len(), 2);
+    }
+
+    #[test]
+    fn test_search_edits_do_not_request_sampling() {
+        let mut searching = true;
+        let mut filter = String::new();
+        let mut selection = 0;
+        let mut sort = SortMode::Cpu;
+        let mut sample = false;
+        let mut render = false;
+        let mut full = false;
+        let mut scroll = Instant::now();
+        for key in [KeyType::Char('a'), KeyType::Backspace, KeyType::Esc] {
+            handle_key(key, &mut searching, &mut filter, &mut selection,
+                &mut sort, &mut sample, &mut render, &mut full, &mut scroll);
+            assert!(!sample, "search must use cached processes");
+            assert!(render && full);
+            render = false;
+            full = false;
+        }
+    }
+
+    #[test]
+    fn test_decode_batched_text_starts_with_first_character() {
+        assert!(decode_key(b"abc") == Some(KeyType::Char('a')));
+    }
 
     #[test]
     fn test_human_bytes() {
