@@ -4,7 +4,7 @@
 
 - Zero-allocation process sampling for maximum speed.
 - No third-party TUI libraries (uses ANSI escape sequences).
-- Data sources are Linux `/proc` and `/sys`, and native macOS sysctl/Mach/libproc APIs.
+- Data sources are Linux `/proc` and `/sys`, and native macOS sysctl/Mach/libproc/IOKit APIs (GPU usage and memory come from the IOAccelerator registry).
 
 ## Features
 

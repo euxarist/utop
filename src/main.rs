@@ -907,8 +907,175 @@ fn read_gpu_cores() -> String {
 }
 
 #[cfg(target_os = "macos")]
+mod iokit {
+    use std::ffi::{c_char, c_void, CString};
+
+    type CFTypeRef = *const c_void;
+    type CFTypeID = usize;
+    type IoObject = u32;
+
+    const UTF8: u32 = 0x0800_0100;
+    const CF_NUMBER_SINT64: isize = 4;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: CFTypeRef);
+        fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
+        fn CFStringGetTypeID() -> CFTypeID;
+        fn CFNumberGetTypeID() -> CFTypeID;
+        fn CFDictionaryGetTypeID() -> CFTypeID;
+        fn CFDataGetTypeID() -> CFTypeID;
+        fn CFStringCreateWithCString(alloc: CFTypeRef, s: *const c_char, encoding: u32) -> CFTypeRef;
+        fn CFStringGetCString(s: CFTypeRef, buf: *mut c_char, size: isize, encoding: u32) -> u8;
+        fn CFNumberGetValue(n: CFTypeRef, kind: isize, out: *mut c_void) -> u8;
+        fn CFDictionaryGetValue(d: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+        fn CFDataGetLength(d: CFTypeRef) -> isize;
+        fn CFDataGetBytePtr(d: CFTypeRef) -> *const u8;
+    }
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> CFTypeRef;
+        fn IOServiceGetMatchingServices(main_port: u32, matching: CFTypeRef, iter: *mut IoObject) -> i32;
+        fn IOIteratorNext(iter: IoObject) -> IoObject;
+        fn IOObjectRelease(obj: IoObject) -> i32;
+        fn IORegistryEntryCreateCFProperty(entry: IoObject, key: CFTypeRef, alloc: CFTypeRef, options: u32) -> CFTypeRef;
+    }
+
+    /// An owned CoreFoundation reference, released on drop.
+    struct Cf(CFTypeRef);
+
+    impl Drop for Cf {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0) }
+        }
+    }
+
+    impl Cf {
+        fn string(s: &str) -> Option<Cf> {
+            let c = CString::new(s).ok()?;
+            let r = unsafe { CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), UTF8) };
+            (!r.is_null()).then_some(Cf(r))
+        }
+    }
+
+    fn type_is(r: CFTypeRef, id: CFTypeID) -> bool {
+        !r.is_null() && unsafe { CFGetTypeID(r) } == id
+    }
+
+    fn to_i64(r: CFTypeRef) -> Option<i64> {
+        if !type_is(r, unsafe { CFNumberGetTypeID() }) { return None; }
+        let mut v = 0_i64;
+        let ok = unsafe { CFNumberGetValue(r, CF_NUMBER_SINT64, &mut v as *mut i64 as *mut c_void) };
+        (ok != 0).then_some(v)
+    }
+
+    fn to_string(r: CFTypeRef) -> Option<String> {
+        if type_is(r, unsafe { CFStringGetTypeID() }) {
+            let mut buf = [0 as c_char; 256];
+            if unsafe { CFStringGetCString(r, buf.as_mut_ptr(), buf.len() as isize, UTF8) } == 0 { return None; }
+            return Some(super::c_char_array_to_string(&buf)).filter(|s| !s.is_empty());
+        }
+        if type_is(r, unsafe { CFDataGetTypeID() }) {
+            let len = unsafe { CFDataGetLength(r) }.max(0) as usize;
+            let bytes = unsafe { std::slice::from_raw_parts(CFDataGetBytePtr(r), len) };
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(len);
+            return Some(String::from_utf8_lossy(&bytes[..end]).trim().to_string()).filter(|s| !s.is_empty());
+        }
+        None
+    }
+
+    /// Values read from one IOAccelerator registry entry.
+    #[derive(Default)]
+    pub struct Accelerator {
+        pub model: Option<String>,
+        pub core_count: Option<i64>,
+        pub utilization: Option<i64>,
+        pub in_use_memory: Option<i64>,
+    }
+
+    fn read_entry(entry: IoObject) -> Accelerator {
+        let prop = |key: &str| -> Option<Cf> {
+            let k = Cf::string(key)?;
+            let r = unsafe { IORegistryEntryCreateCFProperty(entry, k.0, std::ptr::null(), 0) };
+            (!r.is_null()).then_some(Cf(r))
+        };
+        let dict_i64 = |d: &Cf, key: &str| -> Option<i64> {
+            if !type_is(d.0, unsafe { CFDictionaryGetTypeID() }) { return None; }
+            let k = Cf::string(key)?;
+            to_i64(unsafe { CFDictionaryGetValue(d.0, k.0) })
+        };
+        let mut a = Accelerator {
+            model: prop("model").and_then(|r| to_string(r.0)),
+            core_count: prop("gpu-core-count").and_then(|r| to_i64(r.0)),
+            ..Default::default()
+        };
+        if let Some(stats) = prop("PerformanceStatistics") {
+            a.utilization = dict_i64(&stats, "Device Utilization %");
+            a.in_use_memory = dict_i64(&stats, "In use system memory");
+        }
+        a
+    }
+
+    /// Reads every IOAccelerator service (one per GPU).
+    pub fn accelerators() -> Vec<Accelerator> {
+        let mut out = Vec::new();
+        unsafe {
+            let matching = IOServiceMatching(c"IOAccelerator".as_ptr());
+            if matching.is_null() { return out; }
+            let mut iter: IoObject = 0;
+            // IOServiceGetMatchingServices consumes the matching dictionary.
+            if IOServiceGetMatchingServices(0, matching, &mut iter) != 0 { return out; }
+            loop {
+                let entry = IOIteratorNext(iter);
+                if entry == 0 { break; }
+                out.push(read_entry(entry));
+                IOObjectRelease(entry);
+            }
+            IOObjectRelease(iter);
+        }
+        out
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn format_gpu_cores(gpus: &[iokit::Accelerator]) -> String {
+    if gpus.is_empty() { return String::new(); }
+    let gpu_str = if gpus.len() == 1 { "GPU:" } else { "GPUs:" };
+    let cores: i64 = gpus.iter().filter_map(|g| g.core_count).sum();
+    if cores > 0 {
+        let core_str = if cores == 1 { "core" } else { "cores" };
+        format!("{} {}, {} {}", gpu_str, gpus.len(), cores, core_str)
+    } else {
+        format!("{} {}", gpu_str, gpus.len())
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn read_gpu_cores() -> String {
-    String::new()
+    format_gpu_cores(&iokit::accelerators())
+}
+
+/// Apple silicon GPUs share system memory, so GPU memory is reported against
+/// physical RAM.
+#[cfg(target_os = "macos")]
+fn apple_gpu_snapshot(gpus: &[iokit::Accelerator], ram_total: u64) -> GpuSnapshot {
+    let mut g = GpuSnapshot::default();
+    let Some(a) = gpus.iter().find(|a| a.utilization.is_some()).or_else(|| gpus.first()) else { return g; };
+    if let Some(model) = &a.model {
+        // The CPU line already shows the chip name, e.g. "Apple M5".
+        g.name = if model.contains("GPU") { model.clone() } else { format!("{} GPU", model) };
+    }
+    if let Some(u) = a.utilization {
+        g.usage = u.clamp(0, 100) as f64;
+        g.has_usage = true;
+    }
+    if let Some(m) = a.in_use_memory && ram_total > 0 {
+        g.mem_used = (m.max(0) as u64).min(ram_total);
+        g.mem_total = ram_total;
+        g.has_mem = true;
+    }
+    g
 }
 
 #[cfg(target_os = "windows")]
@@ -1445,7 +1612,7 @@ fn read_gpu(s: &mut Sampler, mem: &MemorySnapshot, cached_gpu: &mut GpuSnapshot,
 #[cfg(target_os = "macos")]
 fn read_gpu(
     _s: &mut Sampler,
-    _mem: &MemorySnapshot,
+    mem: &MemorySnapshot,
     cached_gpu: &mut GpuSnapshot,
     last_gpu_read: &mut Instant,
 ) -> GpuSnapshot {
@@ -1455,7 +1622,7 @@ fn read_gpu(
     }
     *last_gpu_read = now;
 
-    let g = GpuSnapshot::default();
+    let g = apple_gpu_snapshot(&iokit::accelerators(), mem.total_bytes);
     *cached_gpu = g.clone();
     g
 }
@@ -2882,6 +3049,33 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apple_gpu_snapshot_reports_usage_and_shared_memory() {
+        let gpus = [iokit::Accelerator {
+            model: Some("Apple M5".into()),
+            core_count: Some(8),
+            utilization: Some(48),
+            in_use_memory: Some(1 << 30),
+        }];
+        let g = apple_gpu_snapshot(&gpus, 16 << 30);
+        assert_eq!(g.name, "Apple M5 GPU");
+        assert!(g.has_usage && g.has_mem && !g.has_temp);
+        assert_eq!(g.usage, 48.0);
+        assert_eq!((g.mem_used, g.mem_total), (1 << 30, 16 << 30));
+        assert_eq!(format_gpu_cores(&gpus), "GPU: 1, 8 cores");
+        assert_eq!(format_gpu_cores(&[]), "");
+        assert!(!apple_gpu_snapshot(&[], 16 << 30).has_usage);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_iokit_accelerators_reads_without_crashing() {
+        for a in iokit::accelerators() {
+            assert!(a.utilization.is_none_or(|u| (0..=100).contains(&u)));
+        }
+    }
 
     #[test]
     fn test_slow_collector_does_not_block_ui_or_quit() {
